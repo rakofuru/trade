@@ -12,5 +12,8 @@
     "report": "node src/report.mjs",
     "verify": "node src/verify.mjs",
     "test": "node src/tests/run-tests.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
   }
 }

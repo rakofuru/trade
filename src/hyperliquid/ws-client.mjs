@@ -1,4 +1,11 @@
 import crypto from "node:crypto";
+import WsWebSocket from "ws";
+
+const WebSocketCtor = typeof globalThis.WebSocket === "function"
+  ? globalThis.WebSocket
+  : WsWebSocket;
+
+const wsImpl = typeof globalThis.WebSocket === "function" ? "global" : "ws";
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -26,6 +33,7 @@ export class HyperliquidWsClient {
     this.running = false;
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
+    this.wsImplLogged = false;
 
     this.seenHashes = new Map();
     this.maxSeen = 5000;
@@ -80,11 +88,16 @@ export class HyperliquidWsClient {
       return;
     }
 
+    if (!this.wsImplLogged) {
+      this.logger.info("Resolved websocket implementation", { ws_impl: wsImpl });
+      this.wsImplLogged = true;
+    }
+
     this.logger.info("Connecting websocket", { url: this.config.wsUrl, attempts: this.reconnectAttempts });
-    const ws = new WebSocket(this.config.wsUrl);
+    const ws = new WebSocketCtor(this.config.wsUrl);
     this.ws = ws;
 
-    ws.addEventListener("open", async () => {
+    this.#bindEvent(ws, "open", async () => {
       this.reconnectAttempts = 0;
       this.logger.info("Websocket connected");
       for (const sub of this.subscriptions) {
@@ -96,7 +109,7 @@ export class HyperliquidWsClient {
       }
     });
 
-    ws.addEventListener("message", async (event) => {
+    this.#bindEvent(ws, "message", async (event) => {
       const raw = typeof event.data === "string" ? event.data : Buffer.from(event.data).toString("utf8");
       if (this.#isDuplicate(raw)) {
         return;
@@ -117,11 +130,11 @@ export class HyperliquidWsClient {
       }
     });
 
-    ws.addEventListener("error", (event) => {
+    this.#bindEvent(ws, "error", (event) => {
       this.logger.warn("Websocket error", { message: event?.message || "unknown" });
     });
 
-    ws.addEventListener("close", async (event) => {
+    this.#bindEvent(ws, "close", async (event) => {
       this.logger.warn("Websocket closed", { code: event.code, reason: event.reason || "" });
       if (this.onLifecycle) {
         await this.onLifecycle({ type: "disconnected", code: event.code, reason: event.reason || "" });
@@ -145,5 +158,37 @@ export class HyperliquidWsClient {
         this.#connect();
       }, delayMs);
     });
+  }
+
+  #bindEvent(ws, eventName, handler) {
+    if (typeof ws.addEventListener === "function") {
+      ws.addEventListener(eventName, handler);
+      return;
+    }
+    if (typeof ws.on !== "function") {
+      throw new Error("Unsupported WebSocket implementation");
+    }
+
+    if (eventName === "open") {
+      ws.on("open", () => handler({}));
+      return;
+    }
+    if (eventName === "message") {
+      ws.on("message", (data) => handler({ data }));
+      return;
+    }
+    if (eventName === "error") {
+      ws.on("error", (error) => handler({ message: error?.message || "unknown" }));
+      return;
+    }
+    if (eventName === "close") {
+      ws.on("close", (code, reason) => {
+        const text = Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason || "");
+        handler({ code, reason: text });
+      });
+      return;
+    }
+
+    ws.on(eventName, handler);
   }
 }
