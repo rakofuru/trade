@@ -38,7 +38,12 @@ require_cmd npm
 [[ -x "${JOURNALCTL_BIN}" ]] || fatal "journalctl not executable: ${JOURNALCTL_BIN}"
 
 require_cmd sudo
-sudo -n true >/dev/null 2>&1 || fatal "Passwordless sudo is required for trader."
+# Don't require NOPASSWD for arbitrary commands like `true`.
+# We only need passwordless sudo for systemctl/journalctl in this script.
+if [[ "${EUID}" -ne 0 ]]; then
+  sudo -n "${SYSTEMCTL_BIN}" --version >/dev/null 2>&1 || fatal "Passwordless sudo is required for ${SYSTEMCTL_BIN}."
+  sudo -n "${JOURNALCTL_BIN}" --version >/dev/null 2>&1 || fatal "Passwordless sudo is required for ${JOURNALCTL_BIN}."
+fi
 
 id -u "${APP_USER}" >/dev/null 2>&1 || fatal "APP_USER does not exist: ${APP_USER}"
 [[ -d "${APP_DIR}" ]] || fatal "APP_DIR does not exist: ${APP_DIR}"
