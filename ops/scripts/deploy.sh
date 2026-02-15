@@ -83,8 +83,9 @@ run_as_app npm ci
 run_as_app npm run test
 run_as_app npm run selftest
 
-RESTART_REQUESTED_AT="$(date -u '+%Y-%m-%d %H:%M:%S')"
-echo "[deploy] restarting service=${SERVICE_NAME} requested_at=${RESTART_REQUESTED_AT} UTC"
+RESTART_REQUESTED_AT_UTC="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+RESTART_REQUESTED_AT_EPOCH="$(date +%s)"
+echo "[deploy] restarting service=${SERVICE_NAME} requested_at=${RESTART_REQUESTED_AT_UTC}"
 
 run_root_cmd "${SYSTEMCTL_BIN}" daemon-reload
 run_root_cmd "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"
@@ -95,14 +96,26 @@ if ! run_root_cmd "${SYSTEMCTL_BIN}" is-active --quiet "${SERVICE_NAME}"; then
   fatal "Service is not active after restart"
 fi
 
-ACTIVE_SINCE="$(run_root_cmd "${SYSTEMCTL_BIN}" show -p ActiveEnterTimestamp --value "${SERVICE_NAME}" | sed 's/[[:space:]]*$//')"
-if [[ -z "${ACTIVE_SINCE}" || "${ACTIVE_SINCE}" == "n/a" ]]; then
-  ACTIVE_SINCE="${RESTART_REQUESTED_AT}"
+ACTIVE_SINCE_USEC_RAW="$(run_root_cmd "${SYSTEMCTL_BIN}" show -p ActiveEnterTimestampUSec --value "${SERVICE_NAME}" | tr -d '[:space:]')"
+LOG_SINCE_SPEC=""
+LOG_SINCE_LABEL=""
+
+if [[ "${ACTIVE_SINCE_USEC_RAW}" =~ ^[0-9]+$ ]] && (( ACTIVE_SINCE_USEC_RAW > 0 )); then
+  ACTIVE_SINCE_EPOCH="$((ACTIVE_SINCE_USEC_RAW / 1000000))"
+  if (( ACTIVE_SINCE_EPOCH < RESTART_REQUESTED_AT_EPOCH )); then
+    ACTIVE_SINCE_EPOCH="${RESTART_REQUESTED_AT_EPOCH}"
+  fi
+  LOG_SINCE_SPEC="@${ACTIVE_SINCE_EPOCH}"
+  LOG_SINCE_LABEL="$(date -u -d "@${ACTIVE_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "epoch:${ACTIVE_SINCE_EPOCH}")"
+else
+  # Last-resort fallback when systemd doesn't expose ActiveEnterTimestampUSec.
+  LOG_SINCE_SPEC="2 minutes ago"
+  LOG_SINCE_LABEL="${LOG_SINCE_SPEC}"
 fi
 
-echo "[deploy] service is active; log_window_since=${ACTIVE_SINCE}"
+echo "[deploy] service is active; log_window_since=${LOG_SINCE_LABEL} (spec=${LOG_SINCE_SPEC})"
 
-JOURNAL_OUTPUT="$(run_root_cmd "${JOURNALCTL_BIN}" -u "${SERVICE_NAME}" --since "${ACTIVE_SINCE}" --no-pager || true)"
+JOURNAL_OUTPUT="$(run_root_cmd "${JOURNALCTL_BIN}" -u "${SERVICE_NAME}" --since "${LOG_SINCE_SPEC}" --no-pager || true)"
 
 echo "[deploy] ---- journal (${SERVICE_NAME}) ----"
 echo "${JOURNAL_OUTPUT}"
