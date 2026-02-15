@@ -1,8 +1,9 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "[bootstrap] run as root (sudo bash ops/scripts/vps_bootstrap.sh <git_repo_url>)" >&2
+  echo "[bootstrap] run as root" >&2
+  echo "Usage: sudo bash vps_bootstrap.sh <git_repo_url>" >&2
   exit 1
 fi
 
@@ -14,6 +15,7 @@ fi
 
 APP_USER="${APP_USER:-hlauto}"
 APP_DIR="${APP_DIR:-/opt/hlauto/trade}"
+SERVICE_NAME="${SERVICE_NAME:-hlauto}"
 
 apt-get update
 apt-get install -y git curl ca-certificates gnupg lsb-release sudo
@@ -35,10 +37,11 @@ else
   echo "[bootstrap] repository already exists at ${APP_DIR}"
 fi
 
-install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" /etc/systemd/system/hlauto.service
+chmod +x "${APP_DIR}/ops/scripts/deploy.sh" "${APP_DIR}/ops/scripts/vps_bootstrap.sh"
+install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 systemctl daemon-reload
-systemctl enable hlauto
+systemctl enable "${SERVICE_NAME}"
 
 echo "[bootstrap] done"
 echo "[bootstrap] next: create ${APP_DIR}/.env.local (do not commit it)"
-echo "[bootstrap] then run: sudo -u ${APP_USER} HLAUTO_APP_DIR=${APP_DIR} bash ${APP_DIR}/ops/scripts/deploy.sh main"
+echo "[bootstrap] then run: sudo HLAUTO_APP_DIR=${APP_DIR} HLAUTO_APP_USER=${APP_USER} bash ${APP_DIR}/ops/scripts/deploy.sh main"

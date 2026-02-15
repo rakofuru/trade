@@ -1,4 +1,7 @@
 node_modules/
 data/
 logs/
+.env
+.env.*
 .env.local
+!.env.local.example

@@ -1,4 +1,4 @@
-﻿name: deploy-vps
+name: deploy-vps
 
 on:
   push:
@@ -22,6 +22,19 @@ jobs:
       contents: read
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Secret guard (.env.local)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch .env.local >/dev/null 2>&1; then
+            echo "::error::.env.local is tracked. Run: git rm --cached .env.local"
+            exit 1
+          fi
+          test -f .env.local.example
+
       - name: Resolve deploy ref
         id: ref
         shell: bash
@@ -46,5 +59,6 @@ jobs:
           command_timeout: 30m
           script: |
             export HLAUTO_APP_DIR="/opt/hlauto/trade"
+            export HLAUTO_APP_USER="hlauto"
             export HLAUTO_SERVICE_NAME="hlauto"
             bash /opt/hlauto/trade/ops/scripts/deploy.sh "${{ steps.ref.outputs.ref }}"
