@@ -60,7 +60,12 @@ Create these repository secrets:
 
 Get SSH fingerprint:
 ```bash
-ssh-keyscan -p <PORT> <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256
+# NOTE: appleboy/ssh-action uses drone-ssh (Go crypto/ssh) which prefers the ECDSA host key when available.
+# Pin the ECDSA host key fingerprint to avoid "host key fingerprint mismatch".
+ssh <HOST> ssh-keygen -l -f /etc/ssh/ssh_host_ecdsa_key.pub | cut -d ' ' -f2
+
+# Alternative (no remote execution), still ECDSA only:
+ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 | awk '{print $2}'
 ```
 
 ## 4. Deploy flow
