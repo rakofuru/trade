@@ -1,0 +1,50 @@
+﻿name: deploy-vps
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_ref:
+        description: "Branch, tag, or commit SHA to deploy (default: current SHA)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Resolve deploy ref
+        id: ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.deploy_ref }}"
+          if [[ -z "${ref}" ]]; then
+            ref="${GITHUB_SHA}"
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "Deploy ref: ${ref}"
+
+      - name: Deploy to VPS over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_FINGERPRINT }}
+          script_stop: true
+          command_timeout: 30m
+          script: |
+            export HLAUTO_APP_DIR="/opt/hlauto/trade"
+            export HLAUTO_SERVICE_NAME="hlauto"
+            bash /opt/hlauto/trade/ops/scripts/deploy.sh "${{ steps.ref.outputs.ref }}"

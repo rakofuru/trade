@@ -1,0 +1,28 @@
+﻿[Unit]
+Description=Hyperliquid Auto Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hlauto
+Group=hlauto
+WorkingDirectory=/opt/hlauto/trade
+EnvironmentFile=/opt/hlauto/trade/.env.local
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGINT
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hlauto/trade/data
+
+[Install]
+WantedBy=multi-user.target
