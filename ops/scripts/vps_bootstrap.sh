@@ -13,7 +13,7 @@ if [[ -z "${REPO_URL}" ]]; then
   exit 1
 fi
 
-APP_USER="${APP_USER:-hlauto}"
+APP_USER="${APP_USER:-trader}"
 APP_DIR="${APP_DIR:-/opt/hlauto/trade}"
 SERVICE_NAME="${SERVICE_NAME:-hlauto}"
 
@@ -25,9 +25,8 @@ if ! command -v node >/dev/null 2>&1; then
   apt-get install -y nodejs
 fi
 
-if ! id -u "${APP_USER}" >/dev/null 2>&1; then
-  useradd --system --create-home --shell /bin/bash "${APP_USER}"
-fi
+id -u "${APP_USER}" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "${APP_USER}"
+id -u hlauto >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash hlauto
 
 install -d -o "${APP_USER}" -g "${APP_USER}" "$(dirname "${APP_DIR}")"
 
@@ -41,7 +40,12 @@ chmod +x "${APP_DIR}/ops/scripts/deploy.sh" "${APP_DIR}/ops/scripts/vps_bootstra
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
+cat >/etc/sudoers.d/hlauto-deploy <<EOF
+${APP_USER} ALL=(root) NOPASSWD: /bin/systemctl, /bin/journalctl
+EOF
+chmod 440 /etc/sudoers.d/hlauto-deploy
+visudo -cf /etc/sudoers.d/hlauto-deploy
 
 echo "[bootstrap] done"
 echo "[bootstrap] next: create ${APP_DIR}/.env.local (do not commit it)"
-echo "[bootstrap] then run: sudo HLAUTO_APP_DIR=${APP_DIR} HLAUTO_APP_USER=${APP_USER} bash ${APP_DIR}/ops/scripts/deploy.sh main"
+echo "[bootstrap] then run as ${APP_USER}: HLAUTO_APP_DIR=${APP_DIR} HLAUTO_APP_USER=${APP_USER} bash ${APP_DIR}/ops/scripts/deploy.sh main"

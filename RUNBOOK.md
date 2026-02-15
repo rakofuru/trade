@@ -1,15 +1,15 @@
-# Hyperliquid Bot Runbook (VPS 24/7 Ops)
+# Hyperliquid Bot Runbook (VPS trader-only)
 
 This runbook covers deployment and operations only. Trading logic is out of scope.
 
 ## 0. Rules
+- SSH user is `trader` only (key-based auth). No root SSH login.
 - Keep `.env.local` only on VPS. Never commit it.
-- Run `deploy.sh` as `root` or a `deployer` user with passwordless sudo.
-- `git` and `npm` run as `hlauto`; `systemctl` and `journalctl` run with admin privileges.
+- `deploy.sh` runs as `trader`; it uses `sudo` only for `systemctl` and `journalctl`.
 
 ## 1. VPS bootstrap (Ubuntu)
 
-### 1-1. Manual setup
+### 1-1. One-time setup (run as trader)
 ```bash
 sudo apt-get update
 sudo apt-get install -y git curl ca-certificates gnupg lsb-release sudo
@@ -18,19 +18,17 @@ sudo apt-get install -y nodejs
 
 sudo useradd --system --create-home --shell /bin/bash hlauto || true
 sudo mkdir -p /opt/hlauto
-sudo chown -R hlauto:hlauto /opt/hlauto
-
-sudo -u hlauto git clone <YOUR_GITHUB_REPO_URL> /opt/hlauto/trade
-sudo chmod +x /opt/hlauto/trade/ops/scripts/deploy.sh /opt/hlauto/trade/ops/scripts/vps_bootstrap.sh
+sudo chown -R trader:trader /opt/hlauto
+git clone <YOUR_GITHUB_REPO_URL> /opt/hlauto/trade
+chmod +x /opt/hlauto/trade/ops/scripts/deploy.sh /opt/hlauto/trade/ops/scripts/vps_bootstrap.sh
 ```
 
-### 1-2. Optional semi-auto setup
-Run bootstrap from a temporary clone (works on fresh Ubuntu):
+### 1-2. sudoers for deploy (required)
+Create `/etc/sudoers.d/hlauto-deploy`:
 ```bash
-tmpdir="$(mktemp -d)"
-git clone --depth 1 <YOUR_GITHUB_REPO_URL> "$tmpdir/trade"
-sudo bash "$tmpdir/trade/ops/scripts/vps_bootstrap.sh" <YOUR_GITHUB_REPO_URL>
-rm -rf "$tmpdir"
+echo 'trader ALL=(root) NOPASSWD: /bin/systemctl, /bin/journalctl' | sudo tee /etc/sudoers.d/hlauto-deploy
+sudo chmod 440 /etc/sudoers.d/hlauto-deploy
+sudo visudo -cf /etc/sudoers.d/hlauto-deploy
 ```
 
 ## 2. systemd install
@@ -42,21 +40,22 @@ sudo systemctl enable hlauto
 
 Create VPS env file:
 ```bash
-sudo -u hlauto cp /opt/hlauto/trade/.env.local.example /opt/hlauto/trade/.env.local
-sudo -u hlauto nano /opt/hlauto/trade/.env.local
+cp /opt/hlauto/trade/.env.local.example /opt/hlauto/trade/.env.local
+nano /opt/hlauto/trade/.env.local
 ```
 
 First deploy:
 ```bash
-sudo HLAUTO_APP_DIR=/opt/hlauto/trade HLAUTO_APP_USER=hlauto HLAUTO_SERVICE_NAME=hlauto bash /opt/hlauto/trade/ops/scripts/deploy.sh main
+cd /opt/hlauto/trade
+HLAUTO_APP_DIR=/opt/hlauto/trade HLAUTO_APP_USER=trader HLAUTO_SERVICE_NAME=hlauto bash ops/scripts/deploy.sh main
 ```
 
 ## 3. GitHub Actions secrets
 Create these repository secrets:
 - `VPS_HOST`
 - `VPS_PORT`
-- `VPS_USER` (root or deployer with passwordless sudo)
-- `VPS_SSH_KEY`
+- `VPS_USER` = `trader`
+- `VPS_SSH_KEY` (private key for trader)
 - `VPS_FINGERPRINT`
 
 Get SSH fingerprint:
@@ -79,7 +78,8 @@ ssh-keyscan -p <PORT> <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256
 ## 5. Rollback
 Deploy a previous commit SHA:
 ```bash
-sudo HLAUTO_APP_DIR=/opt/hlauto/trade HLAUTO_APP_USER=hlauto HLAUTO_SERVICE_NAME=hlauto bash /opt/hlauto/trade/ops/scripts/deploy.sh <COMMIT_SHA>
+cd /opt/hlauto/trade
+HLAUTO_APP_DIR=/opt/hlauto/trade HLAUTO_APP_USER=trader HLAUTO_SERVICE_NAME=hlauto bash ops/scripts/deploy.sh <COMMIT_SHA>
 ```
 
 From Actions: `Run workflow` and set `deploy_ref`.
@@ -127,14 +127,14 @@ git branch backup/local-before-relink
 
 ## 8. Runtime diagnostics
 ```bash
-sudo systemctl status hlauto --no-pager
-sudo journalctl -u hlauto -n 200 --no-pager
-sudo journalctl -u hlauto --since "10 min ago" --no-pager
+sudo /bin/systemctl status hlauto --no-pager
+sudo /bin/journalctl -u hlauto -n 200 --no-pager
+sudo /bin/journalctl -u hlauto --since "10 min ago" --no-pager
 ```
 
 ## 9. Self-audit checklist
 - [ ] `.env.local` is not committed
 - [ ] only `.env.local.example` is committed
-- [ ] deploy user policy is consistent (`root/deployer` + `HLAUTO_APP_USER=hlauto`)
+- [ ] `VPS_USER=trader` (SSH key auth only)
 - [ ] Actions uses SSH fingerprint verification
 - [ ] rollback via `deploy.sh <COMMIT_SHA>` works

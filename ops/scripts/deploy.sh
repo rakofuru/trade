@@ -2,9 +2,11 @@
 set -euo pipefail
 
 APP_DIR="${HLAUTO_APP_DIR:-/opt/hlauto/trade}"
-APP_USER="${HLAUTO_APP_USER:-hlauto}"
+APP_USER="${HLAUTO_APP_USER:-trader}"
 SERVICE_NAME="${HLAUTO_SERVICE_NAME:-hlauto}"
 TARGET_REF="${1:-main}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/bin/systemctl}"
+JOURNALCTL_BIN="${JOURNALCTL_BIN:-/bin/journalctl}"
 
 fatal() {
   echo "[deploy] ERROR: $*" >&2
@@ -24,24 +26,19 @@ run_root_cmd() {
 }
 
 run_as_app() {
-  if [[ "$(id -un)" == "${APP_USER}" ]]; then
-    "$@"
-  elif [[ "${EUID}" -eq 0 ]]; then
-    runuser -u "${APP_USER}" -- "$@"
-  else
-    sudo -n -u "${APP_USER}" -- "$@"
+  if [[ "$(id -un)" != "${APP_USER}" ]]; then
+    fatal "Run this script as ${APP_USER} (trader SSH user). Current user: $(id -un)"
   fi
+  "$@"
 }
 
 require_cmd git
 require_cmd npm
-require_cmd systemctl
-require_cmd journalctl
+[[ -x "${SYSTEMCTL_BIN}" ]] || fatal "systemctl not executable: ${SYSTEMCTL_BIN}"
+[[ -x "${JOURNALCTL_BIN}" ]] || fatal "journalctl not executable: ${JOURNALCTL_BIN}"
 
-if [[ "${EUID}" -ne 0 ]]; then
-  require_cmd sudo
-  sudo -n true >/dev/null 2>&1 || fatal "This script needs passwordless sudo for systemctl/journalctl and sudo -u ${APP_USER}."
-fi
+require_cmd sudo
+sudo -n true >/dev/null 2>&1 || fatal "Passwordless sudo is required for trader."
 
 id -u "${APP_USER}" >/dev/null 2>&1 || fatal "APP_USER does not exist: ${APP_USER}"
 [[ -d "${APP_DIR}" ]] || fatal "APP_DIR does not exist: ${APP_DIR}"
@@ -89,23 +86,23 @@ run_as_app npm run selftest
 RESTART_REQUESTED_AT="$(date -u '+%Y-%m-%d %H:%M:%S')"
 echo "[deploy] restarting service=${SERVICE_NAME} requested_at=${RESTART_REQUESTED_AT} UTC"
 
-run_root_cmd systemctl daemon-reload
-run_root_cmd systemctl restart "${SERVICE_NAME}"
+run_root_cmd "${SYSTEMCTL_BIN}" daemon-reload
+run_root_cmd "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"
 sleep 2
 
-if ! run_root_cmd systemctl is-active --quiet "${SERVICE_NAME}"; then
-  run_root_cmd systemctl status "${SERVICE_NAME}" --no-pager || true
+if ! run_root_cmd "${SYSTEMCTL_BIN}" is-active --quiet "${SERVICE_NAME}"; then
+  run_root_cmd "${SYSTEMCTL_BIN}" status "${SERVICE_NAME}" --no-pager || true
   fatal "Service is not active after restart"
 fi
 
-ACTIVE_SINCE="$(run_root_cmd systemctl show -p ActiveEnterTimestamp --value "${SERVICE_NAME}" | sed 's/[[:space:]]*$//')"
+ACTIVE_SINCE="$(run_root_cmd "${SYSTEMCTL_BIN}" show -p ActiveEnterTimestamp --value "${SERVICE_NAME}" | sed 's/[[:space:]]*$//')"
 if [[ -z "${ACTIVE_SINCE}" || "${ACTIVE_SINCE}" == "n/a" ]]; then
   ACTIVE_SINCE="${RESTART_REQUESTED_AT}"
 fi
 
 echo "[deploy] service is active; log_window_since=${ACTIVE_SINCE}"
 
-JOURNAL_OUTPUT="$(run_root_cmd journalctl -u "${SERVICE_NAME}" --since "${ACTIVE_SINCE}" --no-pager || true)"
+JOURNAL_OUTPUT="$(run_root_cmd "${JOURNALCTL_BIN}" -u "${SERVICE_NAME}" --since "${ACTIVE_SINCE}" --no-pager || true)"
 
 echo "[deploy] ---- journal (${SERVICE_NAME}) ----"
 echo "${JOURNAL_OUTPUT}"

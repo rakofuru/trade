@@ -1,4 +1,7 @@
 name: deploy-vps
+# Secrets contract:
+# - VPS_USER must be "trader" (SSH key auth only)
+# - VPS_FINGERPRINT is required for host key pinning
 
 on:
   push:
@@ -59,6 +62,6 @@ jobs:
           command_timeout: 30m
           script: |
             export HLAUTO_APP_DIR="/opt/hlauto/trade"
-            export HLAUTO_APP_USER="hlauto"
+            export HLAUTO_APP_USER="trader"
             export HLAUTO_SERVICE_NAME="hlauto"
             bash /opt/hlauto/trade/ops/scripts/deploy.sh "${{ steps.ref.outputs.ref }}"
