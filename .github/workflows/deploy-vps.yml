@@ -85,7 +85,7 @@ jobs:
             fp="$(ssh-keygen -lf "${tmp_key}" -E sha256 | awk '{print $2}')"
             rm -f "${tmp_key}"
           else
-            fp="$(printf '%s\n' "${fp_trimmed}" | sed -nE 's/.*(SHA256:[A-Za-z0-9+/=]+).*/\1/p' | head -n1)"
+            fp="$(printf '%s\n' "${fp_trimmed}" | grep -oE 'SHA256:[A-Za-z0-9+/=]+' | head -n1)"
           fi
 
           if [[ -z "${fp}" ]]; then
