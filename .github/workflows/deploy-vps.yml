@@ -51,6 +51,7 @@ jobs:
           echo "Deploy ref: ${ref}"
 
       - name: Validate SSH deploy secrets
+        id: ssh_inputs
         shell: bash
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -71,14 +72,65 @@ jobs:
             exit 1
           fi
 
+          host="$(printf '%s' "${VPS_HOST}" | tr -d '\r' | xargs)"
+          port="$(printf '%s' "${VPS_PORT}" | tr -d '\r' | xargs)"
+          user="$(printf '%s' "${VPS_USER}" | tr -d '\r' | xargs)"
+          fp_raw="$(printf '%s' "${VPS_FINGERPRINT}" | tr -d '\r')"
+          fp_trimmed="$(printf '%s' "${fp_raw}" | xargs)"
+          fp=""
+
+          if [[ "${fp_trimmed}" == ssh-* ]]; then
+            tmp_key="$(mktemp)"
+            printf '%s\n' "${fp_trimmed}" > "${tmp_key}"
+            fp="$(ssh-keygen -lf "${tmp_key}" -E sha256 | awk '{print $2}')"
+            rm -f "${tmp_key}"
+          else
+            fp="$(printf '%s\n' "${fp_trimmed}" | sed -nE 's/.*(SHA256:[A-Za-z0-9+/=]+).*/\1/p' | head -n1)"
+          fi
+
+          if [[ -z "${fp}" ]]; then
+            echo "::error::VPS_FINGERPRINT must contain SHA256:<base64> or a full SSH public key line."
+            exit 1
+          fi
+
+          echo "host=${host}" >> "${GITHUB_OUTPUT}"
+          echo "port=${port}" >> "${GITHUB_OUTPUT}"
+          echo "user=${user}" >> "${GITHUB_OUTPUT}"
+          echo "fingerprint=${fp}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preflight host key fingerprint
+        shell: bash
+        env:
+          VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
+          VPS_PORT: ${{ steps.ssh_inputs.outputs.port }}
+          VPS_FINGERPRINT: ${{ steps.ssh_inputs.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          hostkeys="$(mktemp)"
+          trap 'rm -f "${hostkeys}"' EXIT
+
+          ssh-keyscan -p "${VPS_PORT}" -t ed25519,ecdsa,rsa "${VPS_HOST}" > "${hostkeys}" 2>/dev/null || true
+          if [[ ! -s "${hostkeys}" ]]; then
+            echo "::error::Unable to fetch SSH host keys via ssh-keyscan for ${VPS_HOST}:${VPS_PORT}"
+            exit 1
+          fi
+
+          fingerprints="$(ssh-keygen -lf "${hostkeys}" -E sha256 | awk '{print $2}' | sort -u)"
+          if ! printf '%s\n' "${fingerprints}" | grep -Fxq "${VPS_FINGERPRINT}"; then
+            echo "::error::VPS_FINGERPRINT does not match host keys for ${VPS_HOST}:${VPS_PORT}"
+            echo "Discovered fingerprints:"
+            printf '%s\n' "${fingerprints}"
+            exit 1
+          fi
+
       - name: Deploy to VPS over SSH
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.VPS_HOST }}
-          port: ${{ secrets.VPS_PORT }}
-          username: ${{ secrets.VPS_USER }}
+          host: ${{ steps.ssh_inputs.outputs.host }}
+          port: ${{ steps.ssh_inputs.outputs.port }}
+          username: ${{ steps.ssh_inputs.outputs.user }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          fingerprint: ${{ secrets.VPS_FINGERPRINT }}
+          fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
           command_timeout: 30m
           script: |
             export HLAUTO_APP_DIR="/opt/hlauto/trade"
