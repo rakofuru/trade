@@ -59,13 +59,18 @@ Create these repository secrets:
 - `VPS_FINGERPRINT`
 
 ### 3-1. GitHub Actions 用 SSH鍵の扱い（秘密鍵をVPSに残さない）
-- `VPS_SSH_KEY` は GitHub Secrets に登録し、workflow からのみ利用する。
-- Secrets 設定完了後、VPS 側に残る秘密鍵 `~/.ssh/github_actions_trader` は必ず削除する。
-- `~/.ssh/authorized_keys` に追加した公開鍵行は残す（削除しない）。
+1. GitHub Secrets の `VPS_SSH_KEY` に秘密鍵を登録済みであることを確認する。
+2. VPS 上に残る秘密鍵 `~/.ssh/github_actions_trader` を削除する。
+3. `~/.ssh/github_actions_trader.pub` は残してよい（必須ではない）。
+4. `~/.ssh/authorized_keys` の該当公開鍵行は残す（削除しない）。
 
 ```bash
 rm -f ~/.ssh/github_actions_trader
+# shred が使える環境では以下を優先してもよい（必須ではない）
+# shred -u ~/.ssh/github_actions_trader
 ```
+
+鍵ローテーション時は、`~/.ssh/authorized_keys` の対象公開鍵行を削除すると、その鍵でのログインを無効化できる。
 
 Get SSH fingerprint:
 ```bash

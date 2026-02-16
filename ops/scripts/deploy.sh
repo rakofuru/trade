@@ -110,26 +110,26 @@ if (( FALLBACK_SINCE_EPOCH < RESTART_REQUESTED_AT_EPOCH )); then
   # Keep the "inspect logs only after this deploy restart" safety guard.
   FALLBACK_SINCE_EPOCH="${RESTART_REQUESTED_AT_EPOCH}"
 fi
-FALLBACK_SINCE_UTC="$(date -u -d "@${FALLBACK_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S')"
+FALLBACK_SINCE_UTC="$(date -u -d "@${FALLBACK_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
 if [[ "${ACTIVE_SINCE_USEC_RAW}" =~ ^[0-9]+$ ]] && (( ACTIVE_SINCE_USEC_RAW > 0 )); then
   ACTIVE_SINCE_EPOCH="$((ACTIVE_SINCE_USEC_RAW / 1000000))"
   if (( ACTIVE_SINCE_EPOCH < RESTART_REQUESTED_AT_EPOCH )); then
     ACTIVE_SINCE_EPOCH="${RESTART_REQUESTED_AT_EPOCH}"
   fi
-  ACTIVE_SINCE_UTC="$(date -u -d "@${ACTIVE_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+  ACTIVE_SINCE_UTC="$(date -u -d "@${ACTIVE_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || true)"
   if [[ -n "${ACTIVE_SINCE_UTC}" ]]; then
     LOG_SINCE_SPEC="${ACTIVE_SINCE_UTC}"
-    LOG_SINCE_LABEL="${ACTIVE_SINCE_UTC} UTC"
+    LOG_SINCE_LABEL="${ACTIVE_SINCE_UTC}"
   else
     # Last-resort fallback when timestamp conversion fails unexpectedly.
     LOG_SINCE_SPEC="${FALLBACK_SINCE_UTC}"
-    LOG_SINCE_LABEL="${FALLBACK_SINCE_UTC} UTC (fallback)"
+    LOG_SINCE_LABEL="${FALLBACK_SINCE_UTC} (fallback)"
   fi
 else
   # Last-resort fallback when systemd doesn't expose ActiveEnterTimestampUSec.
   LOG_SINCE_SPEC="${FALLBACK_SINCE_UTC}"
-  LOG_SINCE_LABEL="${FALLBACK_SINCE_UTC} UTC (fallback)"
+  LOG_SINCE_LABEL="${FALLBACK_SINCE_UTC} (fallback)"
 fi
 
 echo "[deploy] service is active; log_window_since=${LOG_SINCE_LABEL} (spec=${LOG_SINCE_SPEC})"
