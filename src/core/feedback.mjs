@@ -183,8 +183,11 @@ export class FeedbackLoop {
         ts: Date.now(),
         fillTime,
         coin,
+        cloid: context.cloid || fill?.cloid || fill?.clientOrderId || null,
         armId: context.armId || "unknown",
         regime: context.regime || "unknown",
+        strategy: context.strategy || "unknown",
+        reason: context.reason || context.strategy || context.armId || "unknown",
         side: buySide ? "buy" : "sell",
         maker: maker,
         taker: taker,
@@ -200,6 +203,7 @@ export class FeedbackLoop {
         latencyMs,
         tif: context.tif || null,
         reduceOnly: Boolean(context.reduceOnly),
+        protectionPlan: context.protectionPlan || null,
       };
 
       this.recentExecution.push(executionRecord);

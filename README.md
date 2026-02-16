@@ -77,12 +77,23 @@ npm.cmd run doctor -- --hours 1
 
 ## 6. Profit Engine
 
-- 上位選択: coin selector が銘柄スコアリング
-  - 指標: spread/depth/expected_fill_prob/reject率/報酬分散
-  - reject 連続時はクールダウンして除外
-- 下位選択: 既存 arm（momentum / mean-reversion）を coin×regime で学習
-- 報酬:
-  - `realized_pnl - fees - estimated_slippage - inventory_penalty - drawdown_penalty (+低重みunrealized)`
+- 対象銘柄: `BTC` / `ETH` のみ
+- レジーム:
+  - `TREND_UP / TREND_DOWN / RANGE / TURBULENCE / NO_TRADE`
+  - 入力: 1m生データ + 内部集計5m/15m（EMA20/50, ADX14, ATR14%, VWAP60, Zscore60）
+- Trend戦略:
+  - Pullback継続（EMA20(1m) 押し戻り後の再クロス）
+  - maker優先 (`tif=Alo`) / TTL 8s
+  - 例外taker (`tif=Ioc`) は TTL失効後の価格乖離条件 + spread/slippage + 日次taker上限を満たす場合のみ
+- Range戦略:
+  - `RANGE` 時のみ、VWAP回帰逆張り（Zscore60）
+  - maker限定 (`tif=Alo`) / TTL 10s / taker禁止
+- 追加ガード:
+  - `DAILY_TRADE_LIMIT`（日次fill上限）
+  - `TAKER_LIMIT`（日次taker fill上限）
+  - `TAKER_STREAK_LIMIT`（連続takerで当日maker-only化）
+  - `PYRAMIDING_BLOCKED`（同方向追加建て禁止）
+  - 反対シグナルは `FLIP_WAIT_FLAT`（先にreduceOnlyでフラット化）
 
 ## 7. Hard Risk Limits
 
@@ -176,5 +187,12 @@ npm.cmd run doctor -- --hours 1
   - `SL_BPS`
   - `TPSL_IS_MARKET`
   - `TPSL_CLEANUP_ON_STOP`
+- Strategy:
+  - `STRATEGY_DAILY_FILL_LIMIT`
+  - `STRATEGY_DAILY_TAKER_FILL_LIMIT`
+  - `STRATEGY_CONSECUTIVE_TAKER_LIMIT`
+  - `STRATEGY_DATA_STALE_*`
+  - `STRATEGY_TREND_*`, `STRATEGY_RANGE_*`
+  - `BTC_*`, `ETH_*`（spread/slippage/turbulence/taker trigger）
  - Vault:
   - `HYPERLIQUID_VAULT_MODE_ENABLED=false`（通常運用で推奨）

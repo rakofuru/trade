@@ -54,6 +54,24 @@ function rewardTotalsFromFeedback(feedbackMetrics) {
   };
 }
 
+function utcDayKey(ts = Date.now()) {
+  return new Date(Number(ts)).toISOString().slice(0, 10);
+}
+
+function utcDayEndTs(ts = Date.now()) {
+  const d = new Date(Number(ts));
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth();
+  const day = d.getUTCDate();
+  return Date.UTC(y, m, day + 1, 0, 0, 0, 0);
+}
+
+function sameDirection(positionSize, side) {
+  if (Number(positionSize || 0) === 0) return false;
+  const dir = Number(positionSize) > 0 ? "buy" : "sell";
+  return dir === String(side || "").toLowerCase();
+}
+
 export class TradingEngine {
   constructor({ config, logger, client, budgetManager, storage, gptAdvisor = null }) {
     this.config = config;
@@ -110,6 +128,15 @@ export class TradingEngine {
     this.tpslLastAttemptAtByCoin = new Map((runtime.tpslLastAttemptAtByCoin || []).map((x) => [x.coin, Number(x.ts || 0)]));
     this.tpslLastEmergencyFlattenAtByCoin = new Map((runtime.tpslLastEmergencyFlattenAtByCoin || []).map((x) => [x.coin, Number(x.ts || 0)]));
     this.tpslBlockedCoins = new Map((runtime.tpslBlockedCoins || []).map((x) => [x.coin, Number(x.until || 0)]));
+    this.strategyBlockedCoins = new Map((runtime.strategyBlockedCoins || []).map((x) => [x.coin, {
+      until: Number(x.until || 0),
+      reason: String(x.reason || ""),
+      dayKey: String(x.dayKey || ""),
+    }]));
+    this.positionProtectionPlansByCoin = new Map((runtime.positionProtectionPlansByCoin || []).map((x) => [x.coin, x]));
+    this.pendingFlipByCoin = new Map((runtime.pendingFlipByCoin || []).map((x) => [x.coin, x]));
+    this.globalNoTradeReason = runtime.globalNoTradeReason || null;
+    this.orderTtlTimers = new Map();
 
     this.assetsByCoin = new Map();
     this.assetMetaByCoin = new Map();
@@ -152,6 +179,7 @@ export class TradingEngine {
     await this.#runBackfill();
     await this.#refreshRiskSnapshot(true);
     this.#assertRiskWithinLimits();
+    await this.#reconcileProtectionState();
     if (this.config.coinSelectionEnabled) {
       await this.#refreshSelectedCoins();
     }
@@ -198,6 +226,10 @@ export class TradingEngine {
       clearTimeout(timer);
     }
     this.timers = [];
+    for (const timer of this.orderTtlTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.orderTtlTimers.clear();
 
     try {
       if (this.ws) {
@@ -630,6 +662,10 @@ export class TradingEngine {
         const cloid = fill?.cloid || fill?.clientOrderId;
         if (cloid) {
           this.openOrders.delete(cloid);
+          if (this.orderTtlTimers.has(cloid)) {
+            clearTimeout(this.orderTtlTimers.get(cloid));
+            this.orderTtlTimers.delete(cloid);
+          }
         }
       }
       for (const record of processed.records || []) {
@@ -639,6 +675,9 @@ export class TradingEngine {
           rejected: false,
           filled: true,
         });
+      }
+      if ((processed.records || []).length > 0) {
+        await this.#handleProcessedFills(processed.records);
       }
       if (count > 0) {
         this.logger.info("Ingested fills from WS", { count });
@@ -662,11 +701,19 @@ export class TradingEngine {
         if (terminal) {
           if (cloid) {
             this.openOrders.delete(cloid);
+            if (this.orderTtlTimers.has(cloid)) {
+              clearTimeout(this.orderTtlTimers.get(cloid));
+              this.orderTtlTimers.delete(cloid);
+            }
           }
           if (oid) {
             const ctx = this.orderContextsByOid.get(String(oid));
             if (ctx?.cloid) {
               this.openOrders.delete(ctx.cloid);
+              if (this.orderTtlTimers.has(ctx.cloid)) {
+                clearTimeout(this.orderTtlTimers.get(ctx.cloid));
+                this.orderTtlTimers.delete(ctx.cloid);
+              }
             }
           }
         }
@@ -701,6 +748,10 @@ export class TradingEngine {
         const cloid = fill?.cloid || fill?.clientOrderId;
         if (cloid) {
           this.openOrders.delete(cloid);
+          if (this.orderTtlTimers.has(cloid)) {
+            clearTimeout(this.orderTtlTimers.get(cloid));
+            this.orderTtlTimers.delete(cloid);
+          }
         }
       }
       for (const record of processed.records || []) {
@@ -710,6 +761,9 @@ export class TradingEngine {
           rejected: false,
           filled: true,
         });
+      }
+      if ((processed.records || []).length > 0) {
+        await this.#handleProcessedFills(processed.records);
       }
 
       for (const fill of fills) {
@@ -724,6 +778,66 @@ export class TradingEngine {
     }
 
     this.lastFillCursor = Math.max(this.lastFillCursor, maxTs);
+  }
+
+  async #handleProcessedFills(records) {
+    if (!Array.isArray(records) || !records.length) {
+      return;
+    }
+    const coinsNeedingProtection = new Set();
+    for (const record of records) {
+      const coin = String(record?.coin || "");
+      if (!coin) {
+        continue;
+      }
+      const fillPx = Number(record?.fillPx || 0);
+      const spreadBps = Number(this.marketData.lastBook(coin)?.spreadBps || 0);
+      const slippageBps = Number(record?.slippageBps || 0);
+      const notional = Number(record?.notional || 0);
+      const plan = record?.protectionPlan && typeof record.protectionPlan === "object"
+        ? record.protectionPlan
+        : null;
+      const isReduceOnly = Boolean(record?.reduceOnly);
+
+      if (!isReduceOnly && plan) {
+        this.positionProtectionPlansByCoin.set(coin, {
+          coin,
+          ...plan,
+          entryPx: fillPx > 0 ? fillPx : Number(plan?.entryPx || 0),
+          entryAt: Number(record?.fillTime || record?.ts || Date.now()),
+          reason: String(record?.reason || plan?.kind || "strategy"),
+          dayKey: utcDayKey(record?.fillTime || record?.ts || Date.now()),
+        });
+      }
+
+      this.storage.appendMetric({
+        type: "fill_execution_summary",
+        coin,
+        side: record?.side,
+        fillPx,
+        notional,
+        maker: Boolean(record?.maker),
+        taker: Boolean(record?.taker),
+        spreadBps,
+        slippageBps,
+        regime: record?.regime || null,
+        slPct: Number(plan?.slPct || 0) || null,
+        tpPct: Number(plan?.tpPct || 0) || null,
+        reason: String(record?.reason || record?.strategy || "unknown"),
+      });
+
+      if (!isReduceOnly) {
+        coinsNeedingProtection.add(coin);
+      }
+    }
+
+    for (const coin of coinsNeedingProtection) {
+      await this.#ensureProtectionForCoin(coin, {
+        source: "entry_fill",
+        strict: true,
+      });
+    }
+    this._dailyExecutionCache = null;
   }
 
   async #runStrategyCycle() {
@@ -754,6 +868,15 @@ export class TradingEngine {
 
     const execResult = await this.#executeSignal(decision);
     if (!execResult.submitted) {
+      if (execResult.nonError) {
+        this.storage.appendMetric({
+          type: "cycle_guard_blocked",
+          cycle: this.cycleCounter,
+          decision,
+          execResult,
+        });
+        return;
+      }
       this.bandit.update({
         coin: decision.coin,
         regime: decision.regime,
@@ -915,9 +1038,19 @@ export class TradingEngine {
   #selectBestSignal() {
     const candidates = [];
 
-    const selected = this.config.coinSelectionEnabled && this.selectedCoins.length
+    const tradeableCoins = this.config.coins
+      .map((x) => String(x || "").toUpperCase())
+      .filter((x) => x === "BTC" || x === "ETH");
+    const selectedRaw = this.config.coinSelectionEnabled && this.selectedCoins.length
       ? this.selectedCoins
       : this.config.coins;
+    const selected = selectedRaw
+      .map((x) => String(x || "").toUpperCase())
+      .filter((x) => tradeableCoins.includes(x));
+
+    if (!selected.length) {
+      return null;
+    }
     for (const coin of selected) {
       if (this.#isCoinBlockedForTrading(coin)) {
         this.storage.appendMetric({
@@ -934,6 +1067,8 @@ export class TradingEngine {
         minBookDepthUsd: this.config.minBookDepthUsd,
       });
       const override = this.improvement.getOverride({ coin, regime, armId: arm.id });
+      const mid = Number(this.marketData.mid(coin) || this.marketData.lastBook(coin)?.mid || 0);
+      const expectedNotionalUsd = mid > 0 ? (mid * Number(this.config.orderSize || 0)) : 0;
 
       const signal = buildSignal({
         arm,
@@ -944,6 +1079,8 @@ export class TradingEngine {
         maxSlippageBps: this.config.maxSlippageBps,
         qualityGate: quality,
         paramOverride: override,
+        config: this.config,
+        expectedNotionalUsd,
       });
 
       if (!signal) {
@@ -960,6 +1097,14 @@ export class TradingEngine {
 
       if (signal.blocked) {
         candidates.push({ coin, regime, arm, signal, blocked: true, score: -Infinity });
+        if (String(signal.reason || "").startsWith("NO_TRADE")) {
+          this.storage.appendMetric({
+            type: "no_trade_guard",
+            coin,
+            reason: signal.reason,
+            detail: signal.explanation?.feature || null,
+          });
+        }
         continue;
       }
 
@@ -976,19 +1121,9 @@ export class TradingEngine {
       });
     }
 
-    if (!candidates.length) {
-      const bootstrap = this.#buildBootstrapSignal();
-      if (bootstrap) {
-        return bootstrap;
-      }
-      return null;
-    }
+    if (!candidates.length) return null;
     const executable = candidates.filter((x) => !x.signal?.blocked);
     if (!executable.length) {
-      const bootstrap = this.#buildBootstrapSignal();
-      if (bootstrap) {
-        return bootstrap;
-      }
       candidates.sort((a, b) => b.score - a.score);
       return candidates[0];
     }
@@ -1060,6 +1195,66 @@ export class TradingEngine {
       throw new Error(`Unknown asset for coin ${signal.coin}`);
     }
     const openPositions = summarizeOpenPositions(this.lastUserState || {});
+    const coinPosition = openPositions.find((p) => String(p.coin || "") === String(signal.coin || "")) || null;
+    const entryGuard = this.#evaluateEntryGuards({
+      signal,
+      coin,
+      openPositions,
+      coinPosition,
+    });
+    if (entryGuard.blocked) {
+      this.storage.appendMetric({
+        type: "entry_guard_block",
+        coin,
+        reason: entryGuard.reason,
+        detail: entryGuard.detail || null,
+      });
+      return {
+        submitted: false,
+        nonError: true,
+        outcome: {
+          error: entryGuard.reason,
+          status: "guard_blocked",
+          detail: entryGuard.detail || null,
+        },
+      };
+    }
+
+    if (!signal.reduceOnly && coinPosition) {
+      if (sameDirection(coinPosition.size, signal.side)) {
+        return {
+          submitted: false,
+          nonError: true,
+          outcome: {
+            error: "PYRAMIDING_BLOCKED",
+            status: "guard_blocked",
+          },
+        };
+      }
+      const flattened = await this.#flattenSinglePosition(coinPosition, `flip_flatten:${signal.side}`);
+      this.pendingFlipByCoin.set(String(signal.coin), {
+        coin: String(signal.coin),
+        requestedSide: String(signal.side),
+        requestedAt: Date.now(),
+      });
+      this.storage.appendMetric({
+        type: "flip_flatten_first",
+        coin: signal.coin,
+        fromSize: Number(coinPosition.size || 0),
+        targetSide: signal.side,
+        submitted: Boolean(flattened),
+      });
+      return {
+        submitted: false,
+        nonError: true,
+        outcome: {
+          error: "FLIP_WAIT_FLAT",
+          status: "flatten_submitted",
+          detail: { flattened: Boolean(flattened) },
+        },
+      };
+    }
+
     const hasCoinPosition = openPositions.some((p) => p.coin === signal.coin);
     if (
       !signal.reduceOnly
@@ -1073,9 +1268,21 @@ export class TradingEngine {
     }
 
     const mid = this.marketData.mid(signal.coin) || signal.limitPx;
+    let requestedSize = Number(signal.sz || 0);
+    let riskSizing = null;
+    if (!signal.reduceOnly && Number(signal?.protectionPlan?.slPct || 0) > 0) {
+      riskSizing = this.#computeRiskBasedSize({
+        coin: signal.coin,
+        mid,
+        slPct: Number(signal.protectionPlan.slPct),
+      });
+      if (Number(riskSizing?.size || 0) > 0) {
+        requestedSize = Number(riskSizing.size);
+      }
+    }
     const maxOrderNotional = minPositive(this.config.tradeMaxNotionalUsd, this.config.riskMaxOrderNotionalUsd);
     const adjustedSize = adjustSizeForNotional({
-      requestedSize: signal.sz,
+      requestedSize,
       mid,
       minNotionalUsd: this.config.tradeMinNotionalUsd,
       maxNotionalUsd: maxOrderNotional,
@@ -1084,6 +1291,7 @@ export class TradingEngine {
       ...signal,
       sz: adjustedSize.size,
       sizing: adjustedSize,
+      riskSizing,
     };
 
     const sideKey = `${signal.coin}:${signal.side}`;
@@ -1107,7 +1315,12 @@ export class TradingEngine {
     let finalResult = primary;
     let rejectionClass = classifyExchangeError(primary.outcome?.error || "");
     if (!primary.submitted) {
-      if (this.config.orderRetryOnAloError && sizedSignal.tif === "Alo" && rejectionClass === "bad_alo_px") {
+      if (
+        this.config.orderRetryOnAloError
+        && sizedSignal.tif === "Alo"
+        && rejectionClass === "bad_alo_px"
+        && Boolean(sizedSignal.allowAloAutoRetry)
+      ) {
         const retrySignal = this.#buildAloFallbackIocSignal(sizedSignal);
         if (retrySignal) {
           this.storage.appendMetric({
@@ -1196,6 +1409,9 @@ export class TradingEngine {
       size: usedSignal.sz,
       sentAt,
       explanation: usedSignal.explanation,
+      reason: usedSignal.explanation?.style || usedSignal.strategy || arm.strategy,
+      protectionPlan: usedSignal.protectionPlan || null,
+      signalMid: Number(this.marketData.mid(usedSignal.coin) || 0),
     };
 
     this.orderContextsByCloid.set(cloid, context);
@@ -1217,6 +1433,8 @@ export class TradingEngine {
       response: outcome,
       raw: rawResponse,
       sizing: usedSignal.sizing,
+      protectionPlan: usedSignal.protectionPlan || null,
+      reason: context.reason,
     };
 
     this.storage.appendOrderEvent(record);
@@ -1233,6 +1451,15 @@ export class TradingEngine {
         createdAt: sentAt,
         oid: outcome.oid,
       });
+      if (usedSignal.tif === "Alo" && Number(usedSignal.ttlMs || 0) > 0) {
+        this.#scheduleMakerOrderTtl({
+          cloid,
+          coin: usedSignal.coin,
+          asset,
+          signal: usedSignal,
+          context,
+        });
+      }
     } else {
       this.openOrders.delete(cloid);
     }
@@ -1447,6 +1674,17 @@ export class TradingEngine {
     const openPositions = summarizeOpenPositions(this.lastUserState || {});
     const positionNotional = inventoryNotional(this.lastUserState || {});
     const openOrders = this.openOrders.size;
+    const openCoins = new Set(openPositions.map((p) => String(p.coin || "")));
+    for (const coin of this.pendingFlipByCoin.keys()) {
+      if (!openCoins.has(String(coin))) {
+        this.pendingFlipByCoin.delete(String(coin));
+      }
+    }
+    for (const coin of this.positionProtectionPlansByCoin.keys()) {
+      if (!openCoins.has(String(coin))) {
+        this.positionProtectionPlansByCoin.delete(String(coin));
+      }
+    }
 
     this.riskSnapshot = {
       checkedAt: now,
@@ -1681,6 +1919,444 @@ export class TradingEngine {
     };
   }
 
+  #symbolRules(coin) {
+    const safeCoin = String(coin || "").toUpperCase();
+    const defaults = this.config.strategySymbolDefaults || {};
+    const specific = (this.config.strategySymbolRules || {})[safeCoin] || {};
+    return {
+      ...defaults,
+      ...specific,
+    };
+  }
+
+  #dailyExecutionStats() {
+    const now = Date.now();
+    const dayKey = utcDayKey(now);
+    if (this._dailyExecutionCache && this._dailyExecutionCache.dayKey === dayKey && (now - this._dailyExecutionCache.ts) < 5000) {
+      return this._dailyExecutionCache.stats;
+    }
+    const dayStart = Date.parse(`${dayKey}T00:00:00.000Z`);
+    const rows = this.storage.readStream("execution", { maxLines: 60000 })
+      .filter((x) => Number(x?.ts || 0) >= dayStart)
+      .filter((x) => ["BTC", "ETH"].includes(String(x?.coin || "").toUpperCase()))
+      .sort((a, b) => Number(a?.fillTime || a?.ts || 0) - Number(b?.fillTime || b?.ts || 0));
+    let takerStreak = 0;
+    let makerOnlyRestOfDay = false;
+    for (const row of rows) {
+      if (Boolean(row?.taker)) {
+        takerStreak += 1;
+        if (takerStreak >= Number(this.config.strategyConsecutiveTakerLimit || 2)) {
+          makerOnlyRestOfDay = true;
+        }
+      } else {
+        takerStreak = 0;
+      }
+    }
+    const stats = {
+      dayKey,
+      fills: rows.length,
+      takerFills: rows.filter((x) => Boolean(x?.taker)).length,
+      makerOnlyRestOfDay,
+    };
+    this._dailyExecutionCache = {
+      dayKey,
+      ts: now,
+      stats,
+    };
+    return stats;
+  }
+
+  #passesTakerGuard({ coin, side, notionalUsd }) {
+    const rules = this.#symbolRules(coin);
+    const spreadBps = Number(this.marketData.lastBook(coin)?.spreadBps || 0);
+    if (!(spreadBps > 0) || spreadBps > Number(rules.takerSpreadBps || 0)) {
+      return {
+        pass: false,
+        reason: "NO_TRADE_SPREAD",
+        detail: {
+          spreadBps,
+          limit: Number(rules.takerSpreadBps || 0),
+        },
+      };
+    }
+    const slippageBps = Number(this.marketData.estimateSlippageBps(coin, {
+      side,
+      notionalUsd: Math.max(10, Number(notionalUsd || 0)),
+    }) || 0);
+    if (slippageBps > Number(rules.takerSlippageBps || 0)) {
+      return {
+        pass: false,
+        reason: "NO_TRADE_SLIPPAGE",
+        detail: {
+          slippageBps,
+          limit: Number(rules.takerSlippageBps || 0),
+        },
+      };
+    }
+    return {
+      pass: true,
+      reason: null,
+      detail: {
+        spreadBps,
+        slippageBps,
+      },
+    };
+  }
+
+  #evaluateEntryGuards({ signal, coin, coinPosition }) {
+    if (signal.reduceOnly) {
+      return { blocked: false };
+    }
+    if (this.globalNoTradeReason) {
+      return {
+        blocked: true,
+        reason: this.globalNoTradeReason,
+      };
+    }
+    if (this.#isCoinBlockedForTrading(coin)) {
+      return {
+        blocked: true,
+        reason: "COIN_BLOCKED",
+      };
+    }
+    if (this.pendingFlipByCoin.has(String(coin))) {
+      return {
+        blocked: true,
+        reason: "FLIP_WAIT_FLAT",
+      };
+    }
+    if (coinPosition && sameDirection(coinPosition.size, signal.side)) {
+      return {
+        blocked: true,
+        reason: "PYRAMIDING_BLOCKED",
+      };
+    }
+
+    const dayStats = this.#dailyExecutionStats();
+    if (dayStats.fills >= Number(this.config.strategyDailyFillLimit || 12)) {
+      return {
+        blocked: true,
+        reason: "DAILY_TRADE_LIMIT",
+        detail: dayStats,
+      };
+    }
+
+    const isTakerIntent = String(signal.tif || "").toLowerCase() === "ioc";
+    if (signal.makerOnly && isTakerIntent) {
+      return {
+        blocked: true,
+        reason: "MAKER_ONLY_SIGNAL",
+      };
+    }
+    if (isTakerIntent) {
+      if (dayStats.takerFills >= Number(this.config.strategyDailyTakerFillLimit || 3)) {
+        return {
+          blocked: true,
+          reason: "TAKER_LIMIT",
+          detail: dayStats,
+        };
+      }
+      if (dayStats.makerOnlyRestOfDay) {
+        return {
+          blocked: true,
+          reason: "TAKER_STREAK_LIMIT",
+          detail: dayStats,
+        };
+      }
+      const mid = Number(this.marketData.mid(coin) || signal.limitPx || 0);
+      const notional = Math.max(0, Number(signal.sz || 0) * Math.max(0, mid));
+      const takerGuard = this.#passesTakerGuard({
+        coin,
+        side: signal.side,
+        notionalUsd: notional,
+      });
+      if (!takerGuard.pass) {
+        return {
+          blocked: true,
+          reason: takerGuard.reason,
+          detail: takerGuard.detail,
+        };
+      }
+    }
+
+    return { blocked: false };
+  }
+
+  #computeRiskBasedSize({ coin, mid, slPct }) {
+    const entryPx = Number(mid || 0);
+    const sl = Number(slPct || 0) / 100;
+    const equity = Number(this.feedback.currentMetrics()?.lastEquity || 0);
+    if (!(entryPx > 0) || !(sl > 0) || !(equity > 0)) {
+      return null;
+    }
+    const notionalRaw = (equity * 0.0015) / sl;
+    const existingGross = Number(this.riskSnapshot?.positionNotional || inventoryNotional(this.lastUserState || {}) || 0);
+    const coinCap = equity * 0.25;
+    const totalRemain = Math.max(0, (equity * 0.50) - existingGross);
+    const cappedNotional = Math.max(0, Math.min(notionalRaw, coinCap, totalRemain));
+    const size = cappedNotional > 0 ? (cappedNotional / entryPx) : 0;
+    return {
+      coin,
+      equity,
+      slPct: Number(slPct || 0),
+      notionalRaw,
+      cappedNotional,
+      coinCap,
+      totalRemain,
+      existingGross,
+      size,
+    };
+  }
+
+  #scheduleMakerOrderTtl({ cloid, coin, asset, signal, context }) {
+    const ttlMs = Math.max(1, Number(signal?.ttlMs || 0));
+    if (!(ttlMs > 0)) {
+      return;
+    }
+    if (this.orderTtlTimers.has(cloid)) {
+      clearTimeout(this.orderTtlTimers.get(cloid));
+      this.orderTtlTimers.delete(cloid);
+    }
+    const timer = setTimeout(() => {
+      this.#guarded(async () => {
+        this.orderTtlTimers.delete(cloid);
+        if (!this.openOrders.has(cloid)) {
+          return;
+        }
+        await this.#cancelByCloid([{ asset, cloid }], "order_ttl_expired");
+        this.openOrders.delete(cloid);
+        this.storage.appendMetric({
+          type: "order_ttl_cancel",
+          coin,
+          cloid,
+          ttlMs,
+          strategy: signal?.strategy || null,
+        });
+
+        if (!signal?.allowTakerAfterTtl) {
+          return;
+        }
+        const rules = this.#symbolRules(coin);
+        const initialMid = Number(context?.signalMid || 0);
+        const nowMid = Number(this.marketData.mid(coin) || 0);
+        if (!(initialMid > 0) || !(nowMid > 0)) {
+          return;
+        }
+        const driftPct = Math.abs(((nowMid - initialMid) / initialMid) * 100);
+        if (driftPct < Number(rules.trendTakerTriggerPct || signal?.takerTriggerMovePct || 999)) {
+          return;
+        }
+        const guard = this.#evaluateEntryGuards({
+          signal: {
+            ...signal,
+            tif: "Ioc",
+            makerOnly: false,
+          },
+          coin,
+          coinPosition: summarizeOpenPositions(this.lastUserState || {}).find((p) => String(p.coin) === String(coin)) || null,
+        });
+        if (guard.blocked) {
+          this.storage.appendMetric({
+            type: "ttl_taker_guard_block",
+            coin,
+            reason: guard.reason,
+            detail: guard.detail || null,
+          });
+          return;
+        }
+        const iocSignal = {
+          ...signal,
+          tif: "Ioc",
+          postOnly: false,
+          makerOnly: false,
+          allowTakerAfterTtl: false,
+          ttlMs: 0,
+          limitPx: Number(signal?.fallbackIocPx || signal?.limitPx || nowMid),
+          allowAloAutoRetry: false,
+        };
+        const fallbackArm = {
+          id: String(context?.armId || "ttl_taker_fallback"),
+          strategy: String(context?.strategy || signal?.strategy || "strategy"),
+        };
+        const res = await this.#executeSignal({
+          signal: iocSignal,
+          coin,
+          arm: fallbackArm,
+          regime: String(context?.regime || signal?.regime || "unknown"),
+        });
+        this.storage.appendMetric({
+          type: "ttl_taker_attempt",
+          coin,
+          cloid,
+          driftPct,
+          submitted: Boolean(res?.submitted),
+          reason: res?.outcome?.error || null,
+        });
+      });
+    }, ttlMs);
+    this.orderTtlTimers.set(cloid, timer);
+  }
+
+  #markCoinBlockedForDay(coin, reason) {
+    const until = utcDayEndTs(Date.now());
+    this.strategyBlockedCoins.set(String(coin), {
+      until,
+      reason: String(reason || "strategy_guard"),
+      dayKey: utcDayKey(Date.now()),
+    });
+    this.storage.appendMetric({
+      type: "strategy_coin_blocked",
+      coin,
+      reason: String(reason || "strategy_guard"),
+      until,
+    });
+  }
+
+  async #reconcileProtectionState() {
+    this.globalNoTradeReason = null;
+    await this.#bootstrapManagedTpSlState();
+    this.lastUserState = await this.client.fetchUserState();
+    const positions = summarizeOpenPositions(this.lastUserState || {});
+    for (const pos of positions) {
+      const coin = String(pos?.coin || "");
+      if (!coin) {
+        continue;
+      }
+      const ok = await this.#ensureProtectionForCoin(coin, {
+        source: "reconcile",
+        strict: true,
+      });
+      if (!ok) {
+        this.globalNoTradeReason = "NO_PROTECTION_RECONCILE";
+      }
+    }
+  }
+
+  async #ensureProtectionForCoin(coin, { source = "runtime", strict = false } = {}) {
+    this.lastUserState = await this.client.fetchUserState();
+    const position = summarizeOpenPositions(this.lastUserState || {})
+      .find((x) => String(x.coin || "") === String(coin)) || null;
+    if (!position) {
+      this.tpslByCoin.delete(coin);
+      this.positionProtectionPlansByCoin.delete(coin);
+      return true;
+    }
+
+    const desired = this.#buildDesiredTpSlForPosition(position);
+    if (!desired || desired.slPx === null || desired.slPx === undefined) {
+      if (strict) {
+        await this.#flattenSinglePosition(position, `no_protection:${source}:plan_unavailable`);
+        this.#markCoinBlockedForDay(coin, "NO_PROTECTION");
+      }
+      return false;
+    }
+
+    let state = this.tpslByCoin.get(coin) || null;
+    if (!state?.slCloid) {
+      const next = await this.#submitPositionTpSlOrders({
+        coin,
+        desired: {
+          ...desired,
+          tpPx: null,
+        },
+      });
+      if (!next?.slCloid) {
+        this.storage.appendError({
+          where: "ensureProtection",
+          coin,
+          error: "NO_PROTECTION_SL_PLACE_FAILED",
+          detail: {
+            source,
+          },
+        });
+        if (strict) {
+          await this.#flattenSinglePosition(position, `no_protection:${source}:sl_place_failed`);
+          this.#markCoinBlockedForDay(coin, "NO_PROTECTION");
+        }
+        return false;
+      }
+      state = mergeTpSlState(state, next);
+      this.tpslByCoin.set(coin, state);
+    }
+
+    if ((desired.tpPx !== null && desired.tpPx !== undefined) && !state?.tpCloid) {
+      const nextTp = await this.#submitPositionTpSlOrders({
+        coin,
+        desired: {
+          ...desired,
+          slPx: null,
+        },
+      });
+      if (nextTp?.tpCloid) {
+        state = mergeTpSlState(state, nextTp);
+        this.tpslByCoin.set(coin, state);
+      } else {
+        this.storage.appendError({
+          where: "ensureProtection",
+          coin,
+          error: "TP_PLACE_FAILED_AFTER_SL",
+          detail: {
+            source,
+          },
+        });
+      }
+    }
+    this.tpslBlockedCoins.delete(coin);
+    return Boolean((this.tpslByCoin.get(coin) || {}).slCloid);
+  }
+
+  async #enforceTimeStopIfNeeded(position) {
+    const coin = String(position?.coin || "");
+    if (!coin) {
+      return false;
+    }
+    const plan = this.positionProtectionPlansByCoin.get(coin);
+    if (!plan || typeof plan !== "object") {
+      return false;
+    }
+    const entryAt = Number(plan.entryAt || 0);
+    const timeStopMs = Number(plan.timeStopMs || 0);
+    if (!(entryAt > 0) || !(timeStopMs > 0)) {
+      return false;
+    }
+    const now = Date.now();
+    if ((now - entryAt) < timeStopMs) {
+      return false;
+    }
+    const entryPx = Number(plan.entryPx || position?.entryPx || 0);
+    const slPct = Number(plan.slPct || 0);
+    if (!(entryPx > 0) || !(slPct > 0)) {
+      return false;
+    }
+    const riskMovePx = entryPx * (slPct / 100);
+    if (!(riskMovePx > 0)) {
+      return false;
+    }
+    const markPx = Number(position?.markPx || this.marketData.mid(coin) || entryPx);
+    const isLong = Number(position?.size || 0) > 0;
+    const progressR = isLong
+      ? ((markPx - entryPx) / riskMovePx)
+      : ((entryPx - markPx) / riskMovePx);
+    const needAtLeastR = Number(plan.timeStopProgressR || 0);
+    if (progressR >= needAtLeastR) {
+      return false;
+    }
+    const flattened = await this.#flattenSinglePosition(position, `time_stop:${coin}`);
+    this.storage.appendMetric({
+      type: "position_time_stop",
+      coin,
+      flattened: Boolean(flattened),
+      progressR,
+      thresholdR: needAtLeastR,
+      elapsedMs: now - entryAt,
+      limitMs: timeStopMs,
+    });
+    if (flattened) {
+      this.pendingFlipByCoin.delete(coin);
+    }
+    return Boolean(flattened);
+  }
+
   async #bootstrapManagedTpSlState() {
     if (!this.config.tpslEnabled) {
       return;
@@ -1764,9 +2440,22 @@ export class TradingEngine {
       if (cancelResult?.allCanceled) {
         this.tpslByCoin.delete(coin);
       }
+      this.positionProtectionPlansByCoin.delete(coin);
+      this.pendingFlipByCoin.delete(coin);
     }
 
     for (const [coin, position] of byCoin.entries()) {
+      const timedOut = await this.#enforceTimeStopIfNeeded(position);
+      if (timedOut) {
+        continue;
+      }
+      const protectedOk = await this.#ensureProtectionForCoin(coin, {
+        source: "sync_precheck",
+        strict: true,
+      });
+      if (!protectedOk) {
+        continue;
+      }
       const desired = this.#buildDesiredTpSlForPosition(position);
       if (!desired) {
         await this.#handleTpSlUnavailable(position, "tpsl_plan_unavailable");
@@ -1837,6 +2526,7 @@ export class TradingEngine {
     const coin = String(position?.coin || "");
     const meta = this.assetMetaByCoin.get(coin);
     const asset = this.assetsByCoin.get(coin);
+    const activePlan = this.positionProtectionPlansByCoin.get(coin) || null;
     if (!meta || asset === undefined) {
       return null;
     }
@@ -1855,7 +2545,8 @@ export class TradingEngine {
       return null;
     }
 
-    const entryPx = Number(position?.entryPx || 0);
+    const plannedEntryPx = Number(activePlan?.entryPx || 0);
+    const entryPx = plannedEntryPx > 0 ? plannedEntryPx : Number(position?.entryPx || 0);
     const markPx = Number(position?.markPx || 0);
     let referencePx = entryPx;
     let referenceSource = "entryPx";
@@ -1919,8 +2610,12 @@ export class TradingEngine {
       return null;
     }
 
-    const tpBps = Number(this.config.tpslTakeProfitBps || 0);
-    const slBps = Number(this.config.tpslStopLossBps || 0);
+    const tpBps = Number(activePlan?.tpPct || 0) > 0
+      ? Number(activePlan.tpPct) * 100
+      : Number(this.config.tpslTakeProfitBps || 0);
+    const slBps = Number(activePlan?.slPct || 0) > 0
+      ? Number(activePlan.slPct) * 100
+      : Number(this.config.tpslStopLossBps || 0);
     if (!(tpBps > 0) && !(slBps > 0)) {
       return null;
     }
@@ -2536,6 +3231,12 @@ export class TradingEngine {
       for (let i = 0; i < cancels.length; i += 10) {
         await this.#cancelByCloid(cancels.slice(i, i + 10), "shutdown_local");
       }
+      for (const row of local) {
+        if (this.orderTtlTimers.has(row.cloid)) {
+          clearTimeout(this.orderTtlTimers.get(row.cloid));
+          this.orderTtlTimers.delete(row.cloid);
+        }
+      }
       this.openOrders.clear();
       this.logger.info("Canceled locally tracked open orders", { count: local.length });
     }
@@ -2721,6 +3422,15 @@ export class TradingEngine {
       tpslLastAttemptAtByCoin: Array.from(this.tpslLastAttemptAtByCoin.entries()).map(([coin, ts]) => ({ coin, ts })),
       tpslLastEmergencyFlattenAtByCoin: Array.from(this.tpslLastEmergencyFlattenAtByCoin.entries()).map(([coin, ts]) => ({ coin, ts })),
       tpslBlockedCoins: Array.from(this.tpslBlockedCoins.entries()).map(([coin, until]) => ({ coin, until })),
+      strategyBlockedCoins: Array.from(this.strategyBlockedCoins.entries()).map(([coin, row]) => ({
+        coin,
+        until: Number(row?.until || 0),
+        reason: String(row?.reason || ""),
+        dayKey: String(row?.dayKey || ""),
+      })),
+      positionProtectionPlansByCoin: Array.from(this.positionProtectionPlansByCoin.values()),
+      pendingFlipByCoin: Array.from(this.pendingFlipByCoin.values()),
+      globalNoTradeReason: this.globalNoTradeReason,
       cycleCounter: this.cycleCounter,
       pendingRewardContext: this.pendingRewardContext,
       lastTotals: this.lastTotals,
@@ -2773,6 +3483,13 @@ export class TradingEngine {
   }
 
   #isCoinBlockedForTrading(coin) {
+    const guard = this.strategyBlockedCoins.get(String(coin));
+    if (guard && Number(guard.until || 0) > 0) {
+      if (Date.now() < Number(guard.until)) {
+        return true;
+      }
+      this.strategyBlockedCoins.delete(String(coin));
+    }
     const until = Number(this.tpslBlockedCoins.get(coin) || 0);
     if (!(until > 0)) {
       return false;
@@ -2822,6 +3539,26 @@ function parseOrderResponses(response, expectedCount = 1) {
     });
   }
   return out;
+}
+
+function mergeTpSlState(current, next) {
+  const base = current && typeof current === "object" ? current : {};
+  const incoming = next && typeof next === "object" ? next : {};
+  return {
+    coin: incoming.coin || base.coin || null,
+    side: incoming.side || base.side || null,
+    size: Number(incoming.size ?? base.size ?? 0),
+    referencePx: Number(incoming.referencePx ?? base.referencePx ?? 0),
+    referenceSource: incoming.referenceSource || base.referenceSource || null,
+    tpPx: incoming.tpPx ?? base.tpPx ?? null,
+    slPx: incoming.slPx ?? base.slPx ?? null,
+    tpCloid: incoming.tpCloid || base.tpCloid || null,
+    slCloid: incoming.slCloid || base.slCloid || null,
+    extraCloids: Array.isArray(incoming.extraCloids)
+      ? incoming.extraCloids
+      : (Array.isArray(base.extraCloids) ? base.extraCloids : []),
+    updatedAt: Date.now(),
+  };
 }
 
 function extractResponseError(response) {
@@ -2918,28 +3655,6 @@ export function buildTpSlOrderRequests({ coin, desired, isMarket }) {
     return [];
   }
   const out = [];
-  if (desired?.tpPx !== null && desired?.tpPx !== undefined) {
-    out.push({
-      tpsl: "tp",
-      triggerPx: Number(desired.tpPx),
-      cloid: makeManagedTpslCloid(coin, "tp"),
-      order: {
-        asset: desired.asset,
-        isBuy: desired.closeSide === "buy",
-        limitPx: Number(desired.tpPx),
-        sz: Number(desired.size),
-        reduceOnly: true,
-        orderType: {
-          trigger: {
-            isMarket: Boolean(isMarket),
-            triggerPx: Number(desired.tpPx),
-            tpsl: "tp",
-          },
-        },
-        cloid: makeManagedTpslCloid(coin, "tp"),
-      },
-    });
-  }
   if (desired?.slPx !== null && desired?.slPx !== undefined) {
     out.push({
       tpsl: "sl",
@@ -2959,6 +3674,28 @@ export function buildTpSlOrderRequests({ coin, desired, isMarket }) {
           },
         },
         cloid: makeManagedTpslCloid(coin, "sl"),
+      },
+    });
+  }
+  if (desired?.tpPx !== null && desired?.tpPx !== undefined) {
+    out.push({
+      tpsl: "tp",
+      triggerPx: Number(desired.tpPx),
+      cloid: makeManagedTpslCloid(coin, "tp"),
+      order: {
+        asset: desired.asset,
+        isBuy: desired.closeSide === "buy",
+        limitPx: Number(desired.tpPx),
+        sz: Number(desired.size),
+        reduceOnly: true,
+        orderType: {
+          trigger: {
+            isMarket: Boolean(isMarket),
+            triggerPx: Number(desired.tpPx),
+            tpsl: "tp",
+          },
+        },
+        cloid: makeManagedTpslCloid(coin, "tp"),
       },
     });
   }
