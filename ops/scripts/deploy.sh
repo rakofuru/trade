@@ -110,8 +110,15 @@ if [[ "${ACTIVE_SINCE_USEC_RAW}" =~ ^[0-9]+$ ]] && (( ACTIVE_SINCE_USEC_RAW > 0 
   if (( ACTIVE_SINCE_EPOCH < RESTART_REQUESTED_AT_EPOCH )); then
     ACTIVE_SINCE_EPOCH="${RESTART_REQUESTED_AT_EPOCH}"
   fi
-  LOG_SINCE_SPEC="@${ACTIVE_SINCE_EPOCH}"
-  LOG_SINCE_LABEL="$(date -u -d "@${ACTIVE_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "epoch:${ACTIVE_SINCE_EPOCH}")"
+  ACTIVE_SINCE_UTC="$(date -u -d "@${ACTIVE_SINCE_EPOCH}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || true)"
+  if [[ -n "${ACTIVE_SINCE_UTC}" ]]; then
+    LOG_SINCE_SPEC="${ACTIVE_SINCE_UTC}"
+    LOG_SINCE_LABEL="${ACTIVE_SINCE_UTC}"
+  else
+    # Last-resort fallback when timestamp conversion fails unexpectedly.
+    LOG_SINCE_SPEC="2 minutes ago"
+    LOG_SINCE_LABEL="${LOG_SINCE_SPEC}"
+  fi
 else
   # Last-resort fallback when systemd doesn't expose ActiveEnterTimestampUSec.
   LOG_SINCE_SPEC="2 minutes ago"

@@ -58,6 +58,15 @@ Create these repository secrets:
 - `VPS_SSH_KEY` (private key for trader)
 - `VPS_FINGERPRINT`
 
+### 3-1. GitHub Actions 用 SSH鍵の扱い（秘密鍵をVPSに残さない）
+- `VPS_SSH_KEY` は GitHub Secrets に登録し、workflow からのみ利用する。
+- Secrets 設定完了後、VPS 側に残る秘密鍵 `~/.ssh/github_actions_trader` は必ず削除する。
+- `~/.ssh/authorized_keys` に追加した公開鍵行は残す（削除しない）。
+
+```bash
+rm -f ~/.ssh/github_actions_trader
+```
+
 Get SSH fingerprint:
 ```bash
 # NOTE: appleboy/ssh-action uses drone-ssh (Go crypto/ssh) which prefers the ECDSA host key when available.
