@@ -137,3 +137,17 @@ jobs:
             export HLAUTO_APP_USER="trader"
             export HLAUTO_SERVICE_NAME="hlauto"
             bash /opt/hlauto/trade/ops/scripts/deploy.sh "${{ steps.ref.outputs.ref }}"
+
+      - name: Post-deploy ops report (24h summary)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.ssh_inputs.outputs.host }}
+          port: ${{ steps.ssh_inputs.outputs.port }}
+          username: ${{ steps.ssh_inputs.outputs.user }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
+          command_timeout: 30m
+          script: |
+            export HLAUTO_APP_DIR="/opt/hlauto/trade"
+            export HLAUTO_SERVICE_NAME="hlauto"
+            bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only

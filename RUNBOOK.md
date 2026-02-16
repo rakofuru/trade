@@ -157,3 +157,20 @@ sudo /bin/journalctl -u hlauto --since "10 min ago" --no-pager
 - [ ] `VPS_USER=trader` (SSH key auth only)
 - [ ] Actions uses SSH fingerprint verification
 - [ ] rollback via `deploy.sh <COMMIT_SHA>` works
+
+## 10. Ops invariant report
+Run the post-trade invariant audit for the last 24h:
+```bash
+cd /opt/hlauto/trade
+bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto
+```
+
+Summary only (for CI / quick checks):
+```bash
+bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto --summary-only
+```
+
+The report must show:
+- Invariant A: `NO_PROTECTION` incidents = 0 and no prolonged SL attach delay.
+- Invariant B: no same-direction add, no `flatten -> new` ordering violation.
+- Invariant C: no taker spread/slippage threshold violation.

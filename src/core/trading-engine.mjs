@@ -134,7 +134,9 @@ export class TradingEngine {
       dayKey: String(x.dayKey || ""),
     }]));
     this.positionProtectionPlansByCoin = new Map((runtime.positionProtectionPlansByCoin || []).map((x) => [x.coin, x]));
+    this.lastEntryContextByCoin = new Map((runtime.lastEntryContextByCoin || []).map((x) => [x.coin, x]));
     this.pendingFlipByCoin = new Map((runtime.pendingFlipByCoin || []).map((x) => [x.coin, x]));
+    this.recentFlipCompletedByCoin = new Map((runtime.recentFlipCompletedByCoin || []).map((x) => [x.coin, x]));
     this.globalNoTradeReason = runtime.globalNoTradeReason || null;
     this.orderTtlTimers = new Map();
 
@@ -785,6 +787,7 @@ export class TradingEngine {
       return;
     }
     const coinsNeedingProtection = new Set();
+    const latestEntryContextByCoin = new Map();
     for (const record of records) {
       const coin = String(record?.coin || "");
       if (!coin) {
@@ -813,11 +816,13 @@ export class TradingEngine {
       this.storage.appendMetric({
         type: "fill_execution_summary",
         coin,
+        cloid: record?.cloid || null,
         side: record?.side,
         fillPx,
         notional,
         maker: Boolean(record?.maker),
         taker: Boolean(record?.taker),
+        tif: record?.tif || null,
         spreadBps,
         slippageBps,
         regime: record?.regime || null,
@@ -827,14 +832,28 @@ export class TradingEngine {
       });
 
       if (!isReduceOnly) {
+        const entryCtx = {
+          coin,
+          cloid: record?.cloid || null,
+          side: record?.side || null,
+          fillTime: Number(record?.fillTime || record?.ts || Date.now()),
+          regime: record?.regime || null,
+          strategy: record?.strategy || null,
+          reason: String(record?.reason || record?.strategy || "unknown"),
+          dayKey: utcDayKey(record?.fillTime || record?.ts || Date.now()),
+        };
+        latestEntryContextByCoin.set(coin, entryCtx);
+        this.lastEntryContextByCoin.set(coin, entryCtx);
         coinsNeedingProtection.add(coin);
       }
     }
 
     for (const coin of coinsNeedingProtection) {
+      const trigger = latestEntryContextByCoin.get(coin) || this.lastEntryContextByCoin.get(coin) || null;
       await this.#ensureProtectionForCoin(coin, {
         source: "entry_fill",
         strict: true,
+        trigger,
       });
     }
     this._dailyExecutionCache = null;
@@ -1232,17 +1251,21 @@ export class TradingEngine {
         };
       }
       const flattened = await this.#flattenSinglePosition(coinPosition, `flip_flatten:${signal.side}`);
-      this.pendingFlipByCoin.set(String(signal.coin), {
+      const pendingFlip = {
         coin: String(signal.coin),
         requestedSide: String(signal.side),
         requestedAt: Date.now(),
-      });
+        flattenSubmitted: Boolean(flattened),
+        dayKey: utcDayKey(Date.now()),
+      };
+      this.pendingFlipByCoin.set(String(signal.coin), pendingFlip);
       this.storage.appendMetric({
         type: "flip_flatten_first",
         coin: signal.coin,
         fromSize: Number(coinPosition.size || 0),
         targetSide: signal.side,
         submitted: Boolean(flattened),
+        flattenRequestedAt: Number(pendingFlip.requestedAt || 0),
       });
       return {
         submitted: false,
@@ -1427,6 +1450,8 @@ export class TradingEngine {
       limitPx: usedSignal.limitPx,
       size: usedSignal.sz,
       tif: usedSignal.tif,
+      reduceOnly: Boolean(usedSignal.reduceOnly),
+      postOnly: Boolean(usedSignal.postOnly),
       strategy: arm.id,
       regime,
       explanation: usedSignal.explanation,
@@ -1438,6 +1463,33 @@ export class TradingEngine {
     };
 
     this.storage.appendOrderEvent(record);
+    if (!Boolean(usedSignal.reduceOnly)) {
+      const flipState = this.recentFlipCompletedByCoin.get(String(usedSignal.coin)) || null;
+      this.storage.appendMetric({
+        type: "entry_order_submitted",
+        coin: usedSignal.coin,
+        cloid,
+        side: usedSignal.side,
+        tif: usedSignal.tif,
+        strategy: arm.strategy,
+        regime,
+        fromFlip: Boolean(flipState),
+      });
+      if (flipState) {
+        const flatConfirmedAt = Number(flipState.flatConfirmedAt || 0);
+        this.storage.appendMetric({
+          type: "flip_new_entry_submitted",
+          coin: usedSignal.coin,
+          requestedSide: String(flipState.requestedSide || ""),
+          flattenRequestedAt: Number(flipState.requestedAt || 0),
+          flatConfirmedAt: flatConfirmedAt > 0 ? flatConfirmedAt : null,
+          newEntryAt: sentAt,
+          deltaMsFromFlatConfirm: flatConfirmedAt > 0 ? (sentAt - flatConfirmedAt) : null,
+          cloid,
+        });
+        this.recentFlipCompletedByCoin.delete(String(usedSignal.coin));
+      }
+    }
 
     if (outcome.resting) {
       this.openOrders.set(cloid, {
@@ -1677,12 +1729,41 @@ export class TradingEngine {
     const openCoins = new Set(openPositions.map((p) => String(p.coin || "")));
     for (const coin of this.pendingFlipByCoin.keys()) {
       if (!openCoins.has(String(coin))) {
+        const flip = this.pendingFlipByCoin.get(String(coin)) || null;
+        const flatConfirmedAt = Date.now();
+        if (flip) {
+          const completed = {
+            ...flip,
+            flatConfirmedAt,
+            dayKey: utcDayKey(flatConfirmedAt),
+          };
+          this.recentFlipCompletedByCoin.set(String(coin), completed);
+          this.storage.appendMetric({
+            type: "flip_flat_confirmed",
+            coin: String(coin),
+            requestedSide: String(flip.requestedSide || ""),
+            flattenRequestedAt: Number(flip.requestedAt || 0),
+            flatConfirmedAt,
+            flattenCloid: flip.flattenCloid || null,
+          });
+        }
         this.pendingFlipByCoin.delete(String(coin));
       }
     }
     for (const coin of this.positionProtectionPlansByCoin.keys()) {
       if (!openCoins.has(String(coin))) {
         this.positionProtectionPlansByCoin.delete(String(coin));
+      }
+    }
+    for (const coin of this.lastEntryContextByCoin.keys()) {
+      if (!openCoins.has(String(coin))) {
+        this.lastEntryContextByCoin.delete(String(coin));
+      }
+    }
+    for (const [coin, row] of this.recentFlipCompletedByCoin.entries()) {
+      const dayKey = String(row?.dayKey || "");
+      if (dayKey && dayKey !== utcDayKey(now)) {
+        this.recentFlipCompletedByCoin.delete(String(coin));
       }
     }
 
@@ -2020,9 +2101,11 @@ export class TradingEngine {
       };
     }
     if (this.pendingFlipByCoin.has(String(coin))) {
+      const flip = this.pendingFlipByCoin.get(String(coin)) || null;
       return {
         blocked: true,
         reason: "FLIP_WAIT_FLAT",
+        detail: flip,
       };
     }
     if (coinPosition && sameDirection(coinPosition.size, signal.side)) {
@@ -2197,7 +2280,7 @@ export class TradingEngine {
     this.orderTtlTimers.set(cloid, timer);
   }
 
-  #markCoinBlockedForDay(coin, reason) {
+  #markCoinBlockedForDay(coin, reason, detail = null) {
     const until = utcDayEndTs(Date.now());
     this.strategyBlockedCoins.set(String(coin), {
       until,
@@ -2209,6 +2292,7 @@ export class TradingEngine {
       coin,
       reason: String(reason || "strategy_guard"),
       until,
+      detail: detail && typeof detail === "object" ? detail : null,
     });
   }
 
@@ -2225,29 +2309,88 @@ export class TradingEngine {
       const ok = await this.#ensureProtectionForCoin(coin, {
         source: "reconcile",
         strict: true,
+        trigger: {
+          coin,
+          cloid: null,
+          side: Number(pos?.size || 0) > 0 ? "buy" : "sell",
+          reason: "reconcile",
+        },
       });
       if (!ok) {
         this.globalNoTradeReason = "NO_PROTECTION_RECONCILE";
+        this.storage.appendMetric({
+          type: "ensure_protection_reconcile_failed",
+          coin,
+          reason: "NO_PROTECTION_RECONCILE",
+        });
       }
     }
   }
 
-  async #ensureProtectionForCoin(coin, { source = "runtime", strict = false } = {}) {
+  async #ensureProtectionForCoin(coin, { source = "runtime", strict = false, trigger = null } = {}) {
+    const startedAt = Date.now();
+    const triggerCtx = (trigger && typeof trigger === "object")
+      ? trigger
+      : (this.lastEntryContextByCoin.get(String(coin)) || null);
+    this.storage.appendMetric({
+      type: "ensure_protection_start",
+      coin,
+      source,
+      strict: Boolean(strict),
+      triggerCloid: triggerCtx?.cloid || null,
+      triggerSide: triggerCtx?.side || null,
+      triggerReason: triggerCtx?.reason || null,
+    });
     this.lastUserState = await this.client.fetchUserState();
     const position = summarizeOpenPositions(this.lastUserState || {})
       .find((x) => String(x.coin || "") === String(coin)) || null;
     if (!position) {
       this.tpslByCoin.delete(coin);
       this.positionProtectionPlansByCoin.delete(coin);
+      this.storage.appendMetric({
+        type: "ensure_protection_done",
+        coin,
+        source,
+        strict: Boolean(strict),
+        ok: true,
+        hasPosition: false,
+        hasSl: false,
+        triggerCloid: triggerCtx?.cloid || null,
+        triggerSide: triggerCtx?.side || null,
+        latencyMs: Date.now() - startedAt,
+      });
       return true;
     }
 
+    const positionSide = Number(position?.size || 0) > 0 ? "long" : "short";
     const desired = this.#buildDesiredTpSlForPosition(position);
     if (!desired || desired.slPx === null || desired.slPx === undefined) {
+      let flattened = false;
       if (strict) {
-        await this.#flattenSinglePosition(position, `no_protection:${source}:plan_unavailable`);
-        this.#markCoinBlockedForDay(coin, "NO_PROTECTION");
+        flattened = await this.#flattenSinglePosition(position, `no_protection:${source}:plan_unavailable`);
+        this.#markCoinBlockedForDay(coin, "NO_PROTECTION", {
+          source,
+          reason: "plan_unavailable",
+          triggerCloid: triggerCtx?.cloid || null,
+          triggerSide: triggerCtx?.side || null,
+        });
       }
+      this.storage.appendMetric({
+        type: "ensure_protection_done",
+        coin,
+        source,
+        strict: Boolean(strict),
+        ok: false,
+        hasPosition: true,
+        hasSl: false,
+        reason: "NO_PROTECTION_PLAN_UNAVAILABLE",
+        triggerCloid: triggerCtx?.cloid || null,
+        triggerSide: triggerCtx?.side || null,
+        positionSide,
+        positionSize: Number(position?.size || 0),
+        flattened: Boolean(flattened),
+        latencyMs: Date.now() - startedAt,
+      });
       return false;
     }
 
@@ -2267,16 +2410,48 @@ export class TradingEngine {
           error: "NO_PROTECTION_SL_PLACE_FAILED",
           detail: {
             source,
+            triggerCloid: triggerCtx?.cloid || null,
+            triggerSide: triggerCtx?.side || null,
           },
         });
+        let flattened = false;
         if (strict) {
-          await this.#flattenSinglePosition(position, `no_protection:${source}:sl_place_failed`);
-          this.#markCoinBlockedForDay(coin, "NO_PROTECTION");
+          flattened = await this.#flattenSinglePosition(position, `no_protection:${source}:sl_place_failed`);
+          this.#markCoinBlockedForDay(coin, "NO_PROTECTION", {
+            source,
+            reason: "sl_place_failed",
+            triggerCloid: triggerCtx?.cloid || null,
+            triggerSide: triggerCtx?.side || null,
+          });
         }
+        this.storage.appendMetric({
+          type: "ensure_protection_done",
+          coin,
+          source,
+          strict: Boolean(strict),
+          ok: false,
+          hasPosition: true,
+          hasSl: false,
+          reason: "NO_PROTECTION_SL_PLACE_FAILED",
+          triggerCloid: triggerCtx?.cloid || null,
+          triggerSide: triggerCtx?.side || null,
+          positionSide,
+          positionSize: Number(position?.size || 0),
+          flattened: Boolean(flattened),
+          latencyMs: Date.now() - startedAt,
+        });
         return false;
       }
       state = mergeTpSlState(state, next);
       this.tpslByCoin.set(coin, state);
+      this.storage.appendMetric({
+        type: "ensure_protection_sl_ok",
+        coin,
+        source,
+        slCloid: next?.slCloid || null,
+        triggerCloid: triggerCtx?.cloid || null,
+        triggerSide: triggerCtx?.side || null,
+      });
     }
 
     if ((desired.tpPx !== null && desired.tpPx !== undefined) && !state?.tpCloid) {
@@ -2290,6 +2465,14 @@ export class TradingEngine {
       if (nextTp?.tpCloid) {
         state = mergeTpSlState(state, nextTp);
         this.tpslByCoin.set(coin, state);
+        this.storage.appendMetric({
+          type: "ensure_protection_tp_ok",
+          coin,
+          source,
+          tpCloid: nextTp?.tpCloid || null,
+          triggerCloid: triggerCtx?.cloid || null,
+          triggerSide: triggerCtx?.side || null,
+        });
       } else {
         this.storage.appendError({
           where: "ensureProtection",
@@ -2299,10 +2482,46 @@ export class TradingEngine {
             source,
           },
         });
+        this.storage.appendMetric({
+          type: "ensure_protection_tp_failed",
+          coin,
+          source,
+          reason: "TP_PLACE_FAILED_AFTER_SL",
+          triggerCloid: triggerCtx?.cloid || null,
+          triggerSide: triggerCtx?.side || null,
+        });
       }
     }
     this.tpslBlockedCoins.delete(coin);
-    return Boolean((this.tpslByCoin.get(coin) || {}).slCloid);
+    const finalState = this.tpslByCoin.get(coin) || {};
+    const hasSl = Boolean(finalState?.slCloid);
+    const donePayload = {
+      type: "ensure_protection_done",
+      coin,
+      source,
+      strict: Boolean(strict),
+      ok: hasSl,
+      hasPosition: true,
+      hasSl,
+      slCloid: finalState?.slCloid || null,
+      tpCloid: finalState?.tpCloid || null,
+      triggerCloid: triggerCtx?.cloid || null,
+      triggerSide: triggerCtx?.side || null,
+      positionSide,
+      positionSize: Number(position?.size || 0),
+      latencyMs: Date.now() - startedAt,
+    };
+    this.storage.appendMetric(donePayload);
+    if (hasSl && Number(donePayload.latencyMs || 0) > 2000) {
+      this.storage.appendMetric({
+        type: "ensure_protection_slow",
+        coin,
+        source,
+        latencyMs: Number(donePayload.latencyMs || 0),
+        triggerCloid: triggerCtx?.cloid || null,
+      });
+    }
+    return hasSl;
   }
 
   async #enforceTimeStopIfNeeded(position) {
@@ -2848,6 +3067,15 @@ export class TradingEngine {
       orderType: { limit: { tif: "Ioc" } },
       cloid: makeCloid(),
     };
+    this.storage.appendMetric({
+      type: "flatten_request",
+      coin,
+      side,
+      size: Number(signal.sz || 0),
+      limitPx: Number(signal.limitPx || 0),
+      reasonTag,
+      cloid: order.cloid,
+    });
     const orderWire = toOrderWire(order);
     const meta = this.assetMetaByCoin.get(coin);
     const preflight = validatePerpOrderWire({
@@ -2882,11 +3110,23 @@ export class TradingEngine {
     this.storage.appendOrderEvent({
       type: "tpsl_emergency_flatten",
       coin,
+      cloid: order.cloid,
       side,
       size: signal.sz,
       limitPx: signal.limitPx,
       response: outcome,
       raw: res.response,
+      reason: reasonTag,
+      reduceOnly: true,
+    });
+    this.storage.appendMetric({
+      type: "flatten_result",
+      coin,
+      side,
+      cloid: order.cloid,
+      submitted: Boolean(submitted),
+      reasonTag,
+      error: outcome.error || null,
     });
     if (!submitted) {
       this.storage.appendError({
@@ -3429,7 +3669,9 @@ export class TradingEngine {
         dayKey: String(row?.dayKey || ""),
       })),
       positionProtectionPlansByCoin: Array.from(this.positionProtectionPlansByCoin.values()),
+      lastEntryContextByCoin: Array.from(this.lastEntryContextByCoin.values()),
       pendingFlipByCoin: Array.from(this.pendingFlipByCoin.values()),
+      recentFlipCompletedByCoin: Array.from(this.recentFlipCompletedByCoin.values()),
       globalNoTradeReason: this.globalNoTradeReason,
       cycleCounter: this.cycleCounter,
       pendingRewardContext: this.pendingRewardContext,

@@ -18,6 +18,7 @@ import {
   computeTpSlTriggerPrices,
   shouldRefreshTpSlState,
 } from "../core/trading-engine.mjs";
+import { analyzeRows } from "../../ops/analyze-ops.mjs";
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "hl-bot-test-"));
@@ -504,6 +505,38 @@ async function testReportOrderCancelSplit() {
   assert.equal(Number(report.summary.exceptionRate.toFixed(6)), Number((1 / 3).toFixed(6)));
 }
 
+async function testOpsAnalyzerInvariantDetection() {
+  const fixturePath = path.join(process.cwd(), "src", "tests", "fixtures", "ops", "analyze-ops-sample.ndjson");
+  const lines = fs.readFileSync(fixturePath, "utf8")
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const rows = lines.map((line) => JSON.parse(line));
+
+  const report = analyzeRows({
+    rows,
+    sinceTs: 1700000000000,
+    untilTs: 1700000062000,
+    chainLimit: 20,
+  });
+
+  assert(report.noProtection.count >= 1, "NO_PROTECTION incident should be detected");
+  assert(report.flattenOrdering.violationCount >= 1, "flip ordering violation should be detected");
+
+  const btc = report.fillsByCoin.BTC;
+  assert(btc, "BTC fill aggregate should exist");
+  assert.equal(Number(btc.fills), 3, "BTC fills should aggregate");
+  assert.equal(Number(btc.takerFills), 3, "BTC taker fills should aggregate");
+
+  assert.equal(Number(report.guardCounts.noTradeByReason.NO_TRADE_SPREAD || 0), 1, "NO_TRADE_SPREAD count should match");
+  assert.equal(Number(report.guardCounts.dailyTradeLimitCount || 0), 1, "DAILY_TRADE_LIMIT should match");
+  assert.equal(Number(report.guardCounts.dailyTakerLimitCount || 0), 1, "daily taker limit projection should match");
+
+  assert(report.executionQuality.spreadBps.count >= 1, "spread distribution should be populated");
+  assert(report.executionQuality.slippageBps.count >= 1, "slippage distribution should be populated");
+  assert(report.executionQuality.takerThresholdViolations.length >= 1, "taker threshold violation should be detected");
+}
+
 async function main() {
   await testStorageRotation();
   await testLifecycleCompressionAndRetention();
@@ -518,6 +551,7 @@ async function main() {
   await testTpSlReduceOnlyAndPreflightBlock();
   await testTpSlOrderRequestSideAndZeroSize();
   await testReportOrderCancelSplit();
+  await testOpsAnalyzerInvariantDetection();
   console.log("All tests passed");
 }
 

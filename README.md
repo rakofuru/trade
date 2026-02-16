@@ -196,3 +196,15 @@ npm.cmd run doctor -- --hours 1
   - `BTC_*`, `ETH_*`（spread/slippage/turbulence/taker trigger）
  - Vault:
   - `HYPERLIQUID_VAULT_MODE_ENABLED=false`（通常運用で推奨）
+
+## 14. Ops Report (Invariant監査)
+
+- 実行:
+  - `bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto`
+- 出力:
+  - 人間向けサマリ + JSON 1件
+- 監査対象:
+  - Invariant A: 未保護ポジション (`NO_PROTECTION`, SL設置遅延)
+  - Invariant B: ナンピン/反転順序違反 (`flip_flatten_first -> flip_flat_confirmed -> new entry`)
+  - Invariant C: 執行品質 (maker/taker, spread/slippage, taker閾値超過)
+- GitHub Actions の `deploy-vps` は deploy 後に `--summary-only` で過去24hサマリを自動出力
