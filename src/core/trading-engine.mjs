@@ -44,6 +44,10 @@ function inferCoinFromTrade(trade, fallback) {
   return trade.coin || trade.asset || fallback || null;
 }
 
+function inferCoinFromCandle(candle, fallback = null) {
+  return candle?.coin || candle?.s || candle?.symbol || fallback || null;
+}
+
 function rewardTotalsFromFeedback(feedbackMetrics) {
   const g = feedbackMetrics.global || {};
   return {
@@ -644,9 +648,9 @@ export class TradingEngine {
 
     if (channel === "candle") {
       const candle = data.candle || data;
-      const coin = candle.coin || data.coin;
+      const coin = inferCoinFromCandle(candle, data.coin || data.s || data.symbol);
       if (coin) {
-        this.marketData.addCandle(coin, candle);
+        this.marketData.addCandle(String(coin), candle);
       }
       this.storage.appendMarketEvent("candle", { data });
       return;
