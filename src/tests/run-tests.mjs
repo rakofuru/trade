@@ -19,6 +19,12 @@ import {
   shouldRefreshTpSlState,
 } from "../core/trading-engine.mjs";
 import { analyzeRows } from "../../ops/analyze-ops.mjs";
+import { buildDailySummary, renderDailySummary } from "../../ops/daily-summary.mjs";
+import {
+  buildPerformanceReport,
+  renderPerformanceMarkdown,
+  renderPerformanceTable,
+} from "../../ops/performance-report.mjs";
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "hl-bot-test-"));
@@ -505,13 +511,30 @@ async function testReportOrderCancelSplit() {
   assert.equal(Number(report.summary.exceptionRate.toFixed(6)), Number((1 / 3).toFixed(6)));
 }
 
-async function testOpsAnalyzerInvariantDetection() {
+function loadOpsFixtureRows() {
   const fixturePath = path.join(process.cwd(), "src", "tests", "fixtures", "ops", "analyze-ops-sample.ndjson");
   const lines = fs.readFileSync(fixturePath, "utf8")
     .split(/\r?\n/)
     .map((x) => x.trim())
     .filter(Boolean);
-  const rows = lines.map((line) => JSON.parse(line));
+  return lines.map((line) => JSON.parse(line));
+}
+
+function writeRowsAsStreams(streamDir, rows) {
+  for (const row of rows) {
+    const ts = Number(row?.ts || Date.now());
+    const stream = String(row?.__stream || "metrics");
+    const day = new Date(ts).toISOString().slice(0, 10);
+    const file = path.join(streamDir, day, `${stream}.jsonl`);
+    ensureDir(path.dirname(file));
+    const payload = { ...row };
+    delete payload.__stream;
+    appendJsonl(file, payload);
+  }
+}
+
+async function testOpsAnalyzerInvariantDetection() {
+  const rows = loadOpsFixtureRows();
 
   const report = analyzeRows({
     rows,
@@ -531,10 +554,59 @@ async function testOpsAnalyzerInvariantDetection() {
   assert.equal(Number(report.guardCounts.noTradeByReason.NO_TRADE_SPREAD || 0), 1, "NO_TRADE_SPREAD count should match");
   assert.equal(Number(report.guardCounts.dailyTradeLimitCount || 0), 1, "DAILY_TRADE_LIMIT should match");
   assert.equal(Number(report.guardCounts.dailyTakerLimitCount || 0), 1, "daily taker limit projection should match");
+  assert(report.tradeAbsenceReasons.top.length >= 1, "trade absence reasons should be populated");
+  assert(Number(report.noProtection.causeCounts.NO_PROTECTION || 0) >= 1, "NO_PROTECTION cause should be classified");
+  assert(["OK", "WATCH", "STOP_RECOMMENDED"].includes(String(report.conclusion || "")), "conclusion should be normalized");
 
   assert(report.executionQuality.spreadBps.count >= 1, "spread distribution should be populated");
   assert(report.executionQuality.slippageBps.count >= 1, "slippage distribution should be populated");
   assert(report.executionQuality.takerThresholdViolations.length >= 1, "taker threshold violation should be detected");
+}
+
+async function testDailySummaryFormatting() {
+  const rows = loadOpsFixtureRows();
+  const report = analyzeRows({
+    rows,
+    sinceTs: 1700000000000,
+    untilTs: 1700000062000,
+    chainLimit: 20,
+  });
+  const summary = buildDailySummary(report, { dayUtc: "2023-11-14" });
+  assert.equal(summary.kind, "daily_summary_v1");
+  assert.equal(summary.dayUtc, "2023-11-14");
+  assert.equal(summary.invariants.A.status, "FAIL", "fixture should fail invariant A");
+  assert.equal(summary.invariants.B.status, "FAIL", "fixture should fail invariant B");
+  assert.equal(summary.conclusion, "STOP_RECOMMENDED", "A/B fail should escalate conclusion");
+  assert(summary.tradeAbsenceReasons.top.length >= 1, "absence top reasons should be present");
+
+  const text = renderDailySummary(summary);
+  assert(text.includes("Daily Ops Summary"), "daily summary text should include title");
+  assert(text.includes("Invariant A"), "daily summary text should include invariants");
+}
+
+async function testPerformanceReportFormats() {
+  const dir = tmpDir();
+  const streamDir = path.join(dir, "streams");
+  const rows = loadOpsFixtureRows();
+  writeRowsAsStreams(streamDir, rows);
+
+  const report = buildPerformanceReport({
+    streamDir,
+    sinceTs: 1700000000000,
+    untilTs: 1700000062000,
+    sinceLabel: "fixture-start",
+    untilLabel: "fixture-end",
+    chainLimit: 20,
+  });
+  assert(report.performance.rows.length >= 2, "performance rows should include fixture coins");
+
+  const table = renderPerformanceTable(report);
+  assert(table.includes("Coin"), "table output should include header");
+  assert(table.includes("BTC"), "table output should include BTC row");
+
+  const markdown = renderPerformanceMarkdown(report);
+  assert(markdown.includes("| Coin |"), "markdown output should include table header");
+  assert(markdown.includes("Top No-Trade / No-Signal Reasons"), "markdown output should include reason section");
 }
 
 async function main() {
@@ -552,6 +624,8 @@ async function main() {
   await testTpSlOrderRequestSideAndZeroSize();
   await testReportOrderCancelSplit();
   await testOpsAnalyzerInvariantDetection();
+  await testDailySummaryFormatting();
+  await testPerformanceReportFormats();
   console.log("All tests passed");
 }
 

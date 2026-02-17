@@ -25,6 +25,8 @@ npm.cmd run start
 npm.cmd run replay
 npm.cmd run report
 npm.cmd run verify -- --hours 1
+npm.cmd run ops:performance -- --hours 24 --format table
+npm.cmd run ops:daily-summary -- --day-offset 1 --summary-only
 npm.cmd run selftest
 npm.cmd run test
 npm.cmd run doctor -- --hours 1
@@ -35,6 +37,8 @@ npm.cmd run doctor -- --hours 1
 - `replay`: 保存データ再生（発注なし）
 - `report`: 人間向け戦績レポート（表形式）
 - `verify`: raw_http の exchange:order エラー検査（時間窓ベース）
+- `ops:performance`: Invariant込みの戦績表示（`table` / `md` / `json`）
+- `ops:daily-summary`: 日次サマリー(JSON + Markdown)の生成
 - `selftest`: 署名系セルフテスト
 - `test`: ローテーション/圧縮/保持期限/rollup/schema の単体テスト
 
@@ -208,3 +212,23 @@ npm.cmd run doctor -- --hours 1
   - Invariant B: ナンピン/反転順序違反 (`flip_flatten_first -> flip_flat_confirmed -> new entry`)
   - Invariant C: 執行品質 (maker/taker, spread/slippage, taker閾値超過)
 - GitHub Actions の `deploy-vps` は deploy 後に `--summary-only` で過去24hサマリを自動出力
+  - 追加: deploy直後に `10 minutes ago` の quick check を実行し、Invariant A/B が FAIL なら workflow を失敗させる
+  - `24h` サマリは warning 扱い（落とさない）
+
+## 15. Daily Summary / Performance CLI
+
+- 日次サマリー生成（前日UTC、保存あり）:
+  - `bash ops/scripts/daily-summary.sh --day-offset 1 --summary-only`
+- 指定日の再生成:
+  - `bash ops/scripts/daily-summary.sh --day 2026-02-17`
+- 出力先:
+  - `data/reports/YYYY-MM-DD/daily-summary.json`
+  - `data/reports/YYYY-MM-DD/daily-summary.md`
+
+- 戦績のオンデマンド表示:
+  - `bash ops/scripts/performance-report.sh --hours 24 --format table`
+  - `bash ops/scripts/performance-report.sh --since "2026-02-17T00:00:00Z" --until "now" --format md`
+  - `bash ops/scripts/performance-report.sh --hours 6 --format json`
+
+- quick check (A/B必須PASS):
+  - `bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto --json-only | node ops/assert-invariants.mjs --require A,B`

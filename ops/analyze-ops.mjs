@@ -377,6 +377,41 @@ function toObjFromMap(map) {
   return out;
 }
 
+function sortedCountEntries(map, limit = 10) {
+  const arr = Array.from(map.entries())
+    .map(([reason, count]) => ({
+      reason: String(reason || ""),
+      count: Number(count || 0),
+    }))
+    .filter((x) => x.reason.length > 0 && x.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) {
+        return b.count - a.count;
+      }
+      return a.reason.localeCompare(b.reason);
+    });
+  return arr.slice(0, Math.max(1, Number(limit || 10)));
+}
+
+function invariantStatus(pass, { allowWarn = false, warn = false } = {}) {
+  if (pass) return "PASS";
+  if (allowWarn && warn) return "WARN";
+  return "FAIL";
+}
+
+function deriveConclusion({ statusA, statusB, statusC, executionRowsCount, topAbsenceReasons }) {
+  if (statusA !== "PASS" || statusB !== "PASS") {
+    return "STOP_RECOMMENDED";
+  }
+  if (statusC !== "PASS") {
+    return "WATCH";
+  }
+  if (Number(executionRowsCount || 0) === 0 && (topAbsenceReasons || []).length > 0) {
+    return "WATCH";
+  }
+  return "OK";
+}
+
 function quantile(sortedValues, q) {
   if (!sortedValues.length) return null;
   const idx = (sortedValues.length - 1) * q;
@@ -472,12 +507,57 @@ function detectNoProtectionIncidents(timeline) {
       coin: ev.coin || null,
       type: ev.type || ev.where || ev.category,
       reason: reason || String(ev.row?.error || "NO_PROTECTION"),
+      causeCategory: classifyNoProtectionCause(reason || String(ev.row?.error || "NO_PROTECTION")),
       side: ev.side || null,
       cloid: ev.cloid || null,
       precedingEvent: findPrecedingEvent(timeline, i, ev.coin || null),
     });
   }
   return incidents;
+}
+
+function classifyNoProtectionCause(reasonRaw) {
+  const reason = String(reasonRaw || "").toUpperCase();
+  if (reason.includes("SL_PLACE_FAILED")) return "SL_PLACE_FAILED";
+  if (reason.includes("EMERGENCY_FLATTEN")) return "EMERGENCY_FLATTEN";
+  if (reason.includes("TIMEOUT")) return "TIMEOUT";
+  if (reason.includes("RECONCILE")) return "RECONCILE";
+  if (reason.includes("NO_PROTECTION")) return "NO_PROTECTION";
+  return "UNKNOWN";
+}
+
+function buildTradeAbsenceReasons(metricsRows, limit = 10) {
+  const counts = new Map();
+  for (const row of metricsRows) {
+    if (!row || typeof row !== "object") continue;
+    const type = String(row.type || "");
+    if (type === "cycle_no_signal") {
+      increment(counts, "cycle_no_signal", 1);
+      continue;
+    }
+    if (type === "cycle_blocked") {
+      const reason = String(
+        row?.decision?.signal?.reason
+        || row?.decision?.reason
+        || extractReason(row)
+        || "cycle_blocked_unknown",
+      );
+      increment(counts, reason, 1);
+      continue;
+    }
+    if (type === "entry_guard_block") {
+      increment(counts, String(extractReason(row) || "entry_guard_block"), 1);
+      continue;
+    }
+    if (type === "no_trade_guard") {
+      increment(counts, String(extractReason(row) || "NO_TRADE_UNKNOWN"), 1);
+      continue;
+    }
+  }
+  return {
+    counts: toObjFromMap(counts),
+    top: sortedCountEntries(counts, limit),
+  };
 }
 
 function buildFlipViolations({ timeline, metricsRows, ordersRows }) {
@@ -834,6 +914,10 @@ export function analyzeRows({
   }
 
   const noProtectionIncidents = detectNoProtectionIncidents(timeline);
+  const noProtectionCauseCountsMap = new Map();
+  for (const incident of noProtectionIncidents) {
+    increment(noProtectionCauseCountsMap, String(incident?.causeCategory || "UNKNOWN"), 1);
+  }
   const ensureDoneRows = metricsRows.filter((x) => x?.type === "ensure_protection_done");
   const ensureLatencies = ensureDoneRows
     .map((x) => toFiniteNumber(x?.latencyMs, null))
@@ -892,6 +976,22 @@ export function analyzeRows({
     slippageBps: quality.slippageBps,
   };
 
+  const tradeAbsenceReasons = buildTradeAbsenceReasons(metricsRows, 10);
+
+  const statusA = invariantStatus(invariantA.pass);
+  const statusB = invariantStatus(invariantB.pass);
+  const statusC = invariantStatus(invariantC.pass, {
+    allowWarn: true,
+    warn: invariantC.takerThresholdViolationCount > 0 && invariantC.takerThresholdViolationCount <= 2,
+  });
+  const conclusion = deriveConclusion({
+    statusA,
+    statusB,
+    statusC,
+    executionRowsCount: executionRows.length,
+    topAbsenceReasons: tradeAbsenceReasons.top,
+  });
+
   return {
     generatedAt: new Date().toISOString(),
     window: {
@@ -907,6 +1007,12 @@ export function analyzeRows({
       B: invariantB,
       C: invariantC,
     },
+    invariantStatus: {
+      A: statusA,
+      B: statusB,
+      C: statusC,
+    },
+    conclusion,
     fillsByCoin,
     guardCounts: {
       noTradeByReason: toObjFromMap(noTradeByReasonMap),
@@ -915,8 +1021,10 @@ export function analyzeRows({
       takerLimitCount,
       takerStreakLimitCount,
     },
+    tradeAbsenceReasons,
     noProtection: {
       count: noProtectionIncidents.length,
+      causeCounts: toObjFromMap(noProtectionCauseCountsMap),
       incidents: noProtectionIncidents,
     },
     flattenOrdering: {
@@ -985,22 +1093,37 @@ export function renderSummary(report) {
   const invA = report?.invariants?.A || {};
   const invB = report?.invariants?.B || {};
   const invC = report?.invariants?.C || {};
-  lines.push(`[ops-report] invariant A (protected positions): ${invA.pass ? "PASS" : "FAIL"} no_protection=${Number(invA.noProtectionIncidentCount || 0)} slow_sl=${Number(invA?.protectionLatencyMs?.violationCount || 0)}`);
-  lines.push(`[ops-report] invariant B (no pyramiding/flip ordering): ${invB.pass ? "PASS" : "FAIL"} same_direction_add=${Number(invB.sameDirectionAddCount || 0)} flip_violations=${Number(invB.flipOrderingViolationCount || 0)}`);
-  lines.push(`[ops-report] invariant C (execution quality): ${invC.pass ? "PASS" : "FAIL"} taker_threshold_violations=${Number(invC.takerThresholdViolationCount || 0)}`);
+  const invStatus = report?.invariantStatus || {};
+  lines.push(`[ops-report] invariant A (protected positions): ${invStatus.A || (invA.pass ? "PASS" : "FAIL")} no_protection=${Number(invA.noProtectionIncidentCount || 0)} slow_sl=${Number(invA?.protectionLatencyMs?.violationCount || 0)}`);
+  lines.push(`[ops-report] invariant B (no pyramiding/flip ordering): ${invStatus.B || (invB.pass ? "PASS" : "FAIL")} same_direction_add=${Number(invB.sameDirectionAddCount || 0)} flip_violations=${Number(invB.flipOrderingViolationCount || 0)}`);
+  lines.push(`[ops-report] invariant C (execution quality): ${invStatus.C || (invC.pass ? "PASS" : "FAIL")} taker_threshold_violations=${Number(invC.takerThresholdViolationCount || 0)}`);
+  lines.push(`[ops-report] conclusion: ${String(report?.conclusion || "n/a")}`);
 
   const noProtectionIncidents = report?.noProtection?.incidents || [];
   if (noProtectionIncidents.length) {
     const sample = noProtectionIncidents[0];
-    lines.push(`[ops-report] NO_PROTECTION sample: coin=${sample.coin || "n/a"} reason=${sample.reason || "n/a"} cloid=${sample.cloid || "n/a"} prev=${sample?.precedingEvent?.type || sample?.precedingEvent?.where || "n/a"}`);
+    lines.push(`[ops-report] NO_PROTECTION sample: coin=${sample.coin || "n/a"} reason=${sample.reason || "n/a"} cause=${sample.causeCategory || "UNKNOWN"} cloid=${sample.cloid || "n/a"} prev=${sample?.precedingEvent?.type || sample?.precedingEvent?.where || "n/a"}`);
   } else {
     lines.push("[ops-report] NO_PROTECTION: 0");
+  }
+  const npCauseCounts = report?.noProtection?.causeCounts || {};
+  const causeKeys = Object.keys(npCauseCounts).sort();
+  for (const key of causeKeys) {
+    lines.push(`[ops-report] NO_PROTECTION_CAUSE ${key}: ${Number(npCauseCounts[key] || 0)}`);
   }
 
   const spread = report?.executionQuality?.spreadBps || {};
   const slippage = report?.executionQuality?.slippageBps || {};
   lines.push(`[ops-report] spread_bps p50/p90/p99: ${formatBps(spread.p50)} / ${formatBps(spread.p90)} / ${formatBps(spread.p99)}`);
   lines.push(`[ops-report] slippage_bps p50/p90/p99: ${formatBps(slippage.p50)} / ${formatBps(slippage.p90)} / ${formatBps(slippage.p99)}`);
+
+  const topAbsence = report?.tradeAbsenceReasons?.top || [];
+  if (topAbsence.length) {
+    lines.push("[ops-report] no-trade/no-signal top reasons:");
+    for (const row of topAbsence.slice(0, 5)) {
+      lines.push(`[ops-report] reason ${row.reason}: ${Number(row.count || 0)}`);
+    }
+  }
 
   const chains = report?.recentChains || [];
   if (chains.length) {

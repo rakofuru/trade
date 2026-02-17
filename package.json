@@ -10,6 +10,9 @@
     "selftest": "node src/selftest.mjs",
     "replay": "node src/replay.mjs",
     "report": "node src/report.mjs",
+    "ops:daily-summary": "node ops/daily-summary.mjs",
+    "ops:performance": "node ops/performance-report.mjs",
+    "ops:assert-invariants": "node ops/assert-invariants.mjs",
     "verify": "node src/verify.mjs",
     "test": "node src/tests/run-tests.mjs"
   },

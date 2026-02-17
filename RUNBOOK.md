@@ -1,4 +1,4 @@
-# Hyperliquid Bot Runbook (VPS trader-only)
+# Hyperliquid Bot Runbook (VPS / Ops)
 
 This runbook covers deployment and operations only. Trading logic is out of scope.
 
@@ -6,10 +6,12 @@ This runbook covers deployment and operations only. Trading logic is out of scop
 - SSH user is `trader` only (key-based auth). No root SSH login.
 - Keep `.env.local` only on VPS. Never commit it.
 - `deploy.sh` runs as `trader`; it uses `sudo` only for `systemctl` and `journalctl`.
+- Hard risk stops are immutable. Do not change Daily/Weekly/MDD/Risk-per-trade/Exposure hard limits in ops work.
+- Invariant A/B are priority-1: unprotected position and flip-order violations are never acceptable.
 
 ## 1. VPS bootstrap (Ubuntu)
 
-### 1-1. One-time setup (run as trader)
+### 1-1. One-time setup (as `trader`)
 ```bash
 sudo apt-get update
 sudo apt-get install -y git curl ca-certificates gnupg lsb-release sudo
@@ -34,8 +36,11 @@ sudo visudo -cf /etc/sudoers.d/hlauto-deploy
 ## 2. systemd install
 ```bash
 sudo cp /opt/hlauto/trade/ops/systemd/hlauto.service /etc/systemd/system/hlauto.service
+sudo cp /opt/hlauto/trade/ops/systemd/hlauto-daily-summary.service /etc/systemd/system/hlauto-daily-summary.service
+sudo cp /opt/hlauto/trade/ops/systemd/hlauto-daily-summary.timer /etc/systemd/system/hlauto-daily-summary.timer
 sudo systemctl daemon-reload
 sudo systemctl enable hlauto
+sudo systemctl enable --now hlauto-daily-summary.timer
 ```
 
 Create VPS env file:
@@ -58,27 +63,24 @@ Create these repository secrets:
 - `VPS_SSH_KEY` (private key for trader)
 - `VPS_FINGERPRINT`
 
-### 3-1. GitHub Actions 用 SSH鍵の扱い（秘密鍵をVPSに残さない）
-1. GitHub Secrets の `VPS_SSH_KEY` に秘密鍵を登録済みであることを確認する。
-2. VPS 上に残る秘密鍵 `~/.ssh/github_actions_trader` を削除する。
-3. `~/.ssh/github_actions_trader.pub` は残してよい（必須ではない）。
-4. `~/.ssh/authorized_keys` の該当公開鍵行は残す（削除しない）。
-
+### 3-1. GitHub Actions SSH key handling (do not leave private key on VPS)
+1. Confirm private key is already stored in GitHub Secrets `VPS_SSH_KEY`.
+2. Remove VPS-side private key file:
 ```bash
 rm -f ~/.ssh/github_actions_trader
-# shred が使える環境では以下を優先してもよい（必須ではない）
+# If available, shred is preferred:
 # shred -u ~/.ssh/github_actions_trader
 ```
-
-鍵ローテーション時は、`~/.ssh/authorized_keys` の対象公開鍵行を削除すると、その鍵でのログインを無効化できる。
+3. `~/.ssh/github_actions_trader.pub` may remain.
+4. Keep the corresponding public-key line in `~/.ssh/authorized_keys`.
+5. For key rotation, remove the public-key line from `authorized_keys` to disable login.
 
 Get SSH fingerprint:
 ```bash
-# NOTE: appleboy/ssh-action uses drone-ssh (Go crypto/ssh) which prefers the ECDSA host key when available.
-# Pin the ECDSA host key fingerprint to avoid "host key fingerprint mismatch".
+# Prefer ECDSA fingerprint (drone-ssh / appleboy behavior)
 ssh <HOST> ssh-keygen -l -f /etc/ssh/ssh_host_ecdsa_key.pub | cut -d ' ' -f2
 
-# Alternative (no remote execution), still ECDSA only:
+# Alternative without remote execution:
 ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 | awk '{print $2}'
 ```
 
@@ -94,6 +96,10 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
   5. `systemctl restart hlauto`
   6. inspect journal logs since service activation time
 
+Post-deploy checks:
+1. Quick check for last `10 minutes`: fail workflow if Invariant A/B is not PASS.
+2. `24h` summary: warning only (do not fail workflow).
+
 ## 5. Rollback
 Deploy a previous commit SHA:
 ```bash
@@ -103,74 +109,76 @@ HLAUTO_APP_DIR=/opt/hlauto/trade HLAUTO_APP_USER=trader HLAUTO_SERVICE_NAME=hlau
 
 From Actions: `Run workflow` and set `deploy_ref`.
 
-## 6. .env.local incident handling
-
-### 6-1. Preventive check
-```bash
-git ls-files --error-unmatch .env.local >/dev/null 2>&1 && echo "NG: tracked" || echo "OK: not tracked"
-```
-
-### 6-2. If tracked now
-```bash
-git rm --cached .env.local
-echo ".env.local" >> .gitignore
-git add .gitignore
-git commit -m "chore: stop tracking .env.local"
-```
-
-### 6-3. If leaked in history (full purge)
-```bash
-cp .env.local /tmp/env.local.backup
-git filter-repo --path .env.local --invert-paths --force
-git for-each-ref --format="delete %(refname)" refs/original | git update-ref --stdin
-git reflog expire --expire=now --all
-git gc --prune=now --aggressive
-git push origin --force --all
-git push origin --force --tags
-```
-
-## 7. Fix local repo if it was accidentally re-initialized
-```bash
-git remote remove origin || true
-git remote add origin <YOUR_GITHUB_REPO_URL>
-git fetch --prune --tags origin
-git checkout -B main origin/main
-git branch --set-upstream-to=origin/main main
-git tag -l
-```
-
-Optional local backup before relink:
-```bash
-git branch backup/local-before-relink
-```
-
-## 8. Runtime diagnostics
+## 6. Runtime diagnostics
 ```bash
 sudo /bin/systemctl status hlauto --no-pager
 sudo /bin/journalctl -u hlauto -n 200 --no-pager
 sudo /bin/journalctl -u hlauto --since "10 min ago" --no-pager
 ```
 
-## 9. Self-audit checklist
-- [ ] `.env.local` is not committed
-- [ ] only `.env.local.example` is committed
-- [ ] `VPS_USER=trader` (SSH key auth only)
-- [ ] Actions uses SSH fingerprint verification
-- [ ] rollback via `deploy.sh <COMMIT_SHA>` works
-
-## 10. Ops invariant report
-Run the post-trade invariant audit for the last 24h:
+## 7. Invariant report (on-demand)
 ```bash
 cd /opt/hlauto/trade
 bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto
 ```
 
-Summary only (for CI / quick checks):
+Summary only:
 ```bash
 bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto --summary-only
 ```
 
-The report must show:
-- Invariant A: `NO_PROTECTION` incidents = 0 and no prolonged SL attach delay.
-- Invariant B: no same-direction add, no `flatten -> new` ordering violation.
-- Invariant C: no taker spread/slippage threshold violation.
+Quick check A/B:
+```bash
+bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto --json-only | node ops/assert-invariants.mjs --require A,B
+```
+
+## 8. Daily summary (UTC auto generation)
+One-shot (previous UTC day):
+```bash
+cd /opt/hlauto/trade
+bash ops/scripts/daily-summary.sh --day-offset 1 --summary-only
+```
+
+Specific day:
+```bash
+bash ops/scripts/daily-summary.sh --day 2026-02-17
+```
+
+Saved files:
+- `data/reports/YYYY-MM-DD/daily-summary.json`
+- `data/reports/YYYY-MM-DD/daily-summary.md`
+
+Timer status:
+```bash
+sudo systemctl status hlauto-daily-summary.timer --no-pager
+sudo systemctl list-timers --all | grep hlauto-daily-summary
+```
+
+## 9. On-demand performance view
+```bash
+cd /opt/hlauto/trade
+bash ops/scripts/performance-report.sh --hours 24 --format table
+bash ops/scripts/performance-report.sh --since "2026-02-17T00:00:00Z" --until "now" --format md
+bash ops/scripts/performance-report.sh --hours 6 --format json
+```
+
+## 10. Failure triage
+1. Quick check failed (A/B):
+   - `bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto`
+   - Focus first on `NO_PROTECTION`, `same_direction_add`, `flip_violations`.
+2. No trades:
+   - `bash ops/scripts/performance-report.sh --hours 6 --format table`
+   - Check top reasons (`cycle_no_signal`, `book_too_thin`, `NO_TRADE_*`).
+3. Daily timer failed:
+   - `sudo journalctl -u hlauto-daily-summary.service -n 200 --no-pager`
+   - `sudo systemctl daemon-reload && sudo systemctl restart hlauto-daily-summary.timer`
+
+## 11. Self-audit checklist
+- [ ] `.env.local` is not committed
+- [ ] only `.env.local.example` is committed
+- [ ] `VPS_USER=trader` (SSH key auth only)
+- [ ] Actions uses SSH fingerprint verification
+- [ ] rollback via `deploy.sh <COMMIT_SHA>` works
+- [ ] quick check enforces Invariant A/B on deploy
+- [ ] daily summary timer is active
+

@@ -138,7 +138,7 @@ jobs:
             export HLAUTO_SERVICE_NAME="hlauto"
             bash /opt/hlauto/trade/ops/scripts/deploy.sh "${{ steps.ref.outputs.ref }}"
 
-      - name: Post-deploy ops report (24h summary)
+      - name: Post-deploy quick check (10m, fail on invariant A/B)
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ steps.ssh_inputs.outputs.host }}
@@ -148,6 +148,38 @@ jobs:
           fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
           command_timeout: 30m
           script: |
+            set -euo pipefail
+            export HLAUTO_APP_DIR="/opt/hlauto/trade"
+            export HLAUTO_SERVICE_NAME="hlauto"
+            bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
+            report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
+            printf '%s\n' "${report_json}" >/tmp/hlauto_quick_report.json
+            node /opt/hlauto/trade/ops/assert-invariants.mjs --input /tmp/hlauto_quick_report.json --require A,B
+
+      - name: Post-deploy ops report (24h summary, warn only)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.ssh_inputs.outputs.host }}
+          port: ${{ steps.ssh_inputs.outputs.port }}
+          username: ${{ steps.ssh_inputs.outputs.user }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
             export HLAUTO_APP_DIR="/opt/hlauto/trade"
             export HLAUTO_SERVICE_NAME="hlauto"
             bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
+            report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
+            printf '%s\n' "${report_json}" | node -e '
+              const fs = require("node:fs");
+              const data = JSON.parse(fs.readFileSync(0, "utf8"));
+              const a = String(data?.invariantStatus?.A || (data?.invariants?.A?.pass ? "PASS" : "FAIL"));
+              const b = String(data?.invariantStatus?.B || (data?.invariants?.B?.pass ? "PASS" : "FAIL"));
+              const c = String(data?.invariantStatus?.C || (data?.invariants?.C?.pass ? "PASS" : "FAIL"));
+              if (a !== "PASS" || b !== "PASS" || c === "FAIL") {
+                console.log(`[ops-report] WARN 24h invariants status A/B/C=${a}/${b}/${c}`);
+              } else {
+                console.log(`[ops-report] OK 24h invariants status A/B/C=${a}/${b}/${c}`);
+              }
+            '

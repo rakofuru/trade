@@ -37,9 +37,13 @@ else
 fi
 
 chmod +x "${APP_DIR}/ops/scripts/deploy.sh" "${APP_DIR}/ops/scripts/vps_bootstrap.sh"
+chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.service" "/etc/systemd/system/hlauto-daily-summary.service"
+install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.timer" "/etc/systemd/system/hlauto-daily-summary.timer"
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
+systemctl enable --now hlauto-daily-summary.timer
 cat >/etc/sudoers.d/hlauto-deploy <<EOF
 ${APP_USER} ALL=(root) NOPASSWD: /bin/systemctl, /bin/journalctl
 EOF

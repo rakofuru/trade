@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Hyperliquid Daily Ops Summary (UTC)
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+AccuracySec=1m
+Unit=hlauto-daily-summary.service
+
+[Install]
+WantedBy=timers.target
+
