@@ -26,7 +26,9 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 id -u "${APP_USER}" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "${APP_USER}"
-id -u hlauto >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash hlauto
+getent group hlauto >/dev/null 2>&1 || groupadd --system hlauto
+id -u hlauto >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash -g hlauto hlauto
+usermod -g hlauto hlauto || true
 
 install -d -o "${APP_USER}" -g "${APP_USER}" "$(dirname "${APP_DIR}")"
 

@@ -18,7 +18,9 @@ sudo apt-get install -y git curl ca-certificates gnupg lsb-release sudo
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
+sudo groupadd --system hlauto || true
 sudo useradd --system --create-home --shell /bin/bash hlauto || true
+sudo usermod -g hlauto hlauto || true
 sudo mkdir -p /opt/hlauto
 sudo chown -R trader:trader /opt/hlauto
 git clone <YOUR_GITHUB_REPO_URL> /opt/hlauto/trade
