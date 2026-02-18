@@ -228,6 +228,8 @@ npm.cmd run doctor -- --hours 1
 - 出力先:
   - `data/reports/YYYY-MM-DD/daily-summary.json`
   - `data/reports/YYYY-MM-DD/daily-summary.md`
+  - JSON/Markdown ともに `Recent Entry Rationales`（entry時点の reasonCode/features）を含む
+  - 例: `jq '.entryRationales[:5]' data/reports/$(date -u -d "yesterday" +%F)/daily-summary.json`
 
 - 戦績のオンデマンド表示:
   - `bash ops/scripts/performance-report.sh --hours 24 --format table`

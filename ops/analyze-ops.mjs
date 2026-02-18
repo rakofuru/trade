@@ -691,10 +691,54 @@ function buildRecentChains({
     .filter((x) => boolValue(x?.reduceOnly))
     .sort((a, b) => Number(toTs(a) || 0) - Number(toTs(b) || 0));
 
+  const fillSummaries = metricsRows
+    .filter((x) => x?.type === "fill_execution_summary")
+    .sort((a, b) => Number(toTs(a) || 0) - Number(toTs(b) || 0));
+  const entrySnapshots = metricsRows
+    .filter((x) => x?.type === "entry_snapshot")
+    .sort((a, b) => Number(toTs(a) || 0) - Number(toTs(b) || 0));
+
+  const summaryByCloid = new Map();
+  for (const row of fillSummaries) {
+    const cloid = String(row?.cloid || "");
+    if (cloid) {
+      summaryByCloid.set(cloid, row);
+    }
+  }
+  const snapshotByCloid = new Map();
+  for (const row of entrySnapshots) {
+    const cloid = String(row?.cloid || "");
+    if (cloid) {
+      snapshotByCloid.set(cloid, row);
+    }
+  }
+
   return entries.map((entry) => {
     const coin = upperCoin(entry?.coin);
     const entryTs = Number(toTs(entry) || 0);
     const entryCloid = entry?.cloid || null;
+    const summary = entryCloid
+      ? (summaryByCloid.get(String(entryCloid)) || null)
+      : null;
+    const fallbackSummary = summary || fillSummaries.find((x) => {
+      if (upperCoin(x?.coin) !== coin) return false;
+      const ts = Number(toTs(x) || 0);
+      return Math.abs(ts - entryTs) <= 10_000;
+    }) || null;
+    const snapshot = entryCloid
+      ? (snapshotByCloid.get(String(entryCloid)) || null)
+      : null;
+    const fallbackSnapshot = snapshot || entrySnapshots.find((x) => {
+      if (upperCoin(x?.coin) !== coin) return false;
+      const ts = Number(toTs(x) || 0);
+      return Math.abs(ts - entryTs) <= 10_000;
+    }) || null;
+    const features = fallbackSnapshot?.features
+      || entry?.explanation?.feature
+      || null;
+    const protectionPlan = fallbackSnapshot?.protectionPlan
+      || null;
+
     const protection = ensureDone.find((x) => {
       if (upperCoin(x?.coin) !== coin) return false;
       const ts = Number(toTs(x) || 0);
@@ -719,7 +763,15 @@ function buildRecentChains({
         taker: boolValue(entry?.taker),
         fillPx: toFiniteNumber(entry?.fillPx, null),
         size: toFiniteNumber(entry?.size, null),
-        regime: entry?.regime || null,
+        regime: entry?.regime || fallbackSnapshot?.regime || null,
+        strategy: entry?.strategy || fallbackSnapshot?.strategy || null,
+        reason: entry?.reason || fallbackSnapshot?.reason || fallbackSummary?.reason || null,
+        reasonCode: fallbackSnapshot?.reasonCode || fallbackSummary?.whyStyle || fallbackSummary?.reason || entry?.reason || null,
+        features,
+        protectionPlan,
+        spreadBps: toFiniteNumber(fallbackSummary?.spreadBps, null),
+        slippageBps: toFiniteNumber(fallbackSummary?.slippageBps, null),
+        snapshotSource: fallbackSnapshot ? "entry_snapshot" : (fallbackSummary ? "fill_execution_summary" : "execution"),
       },
       protection: protection
         ? {
@@ -1133,6 +1185,7 @@ export function renderSummary(report) {
       const e = chain.exit;
       lines.push(
         `[ops-report] chain ${chain.coin} entry=${chain.entry.isoTime || "n/a"} cloid=${chain.entry.cloid || "n/a"} `
+        + `why=${chain.entry.reasonCode || chain.entry.reason || "n/a"} `
         + `protect=${p ? `${p.ok ? "ok" : "ng"}@${p.isoTime || "n/a"}` : "none"} `
         + `exit=${e ? `${e.isoTime || "n/a"}(${e.side || "?"})` : "open"}`,
       );

@@ -139,6 +139,23 @@ export function buildDailySummary(baseReport, { dayUtc }) {
   const absenceTop = Array.isArray(baseReport?.tradeAbsenceReasons?.top)
     ? baseReport.tradeAbsenceReasons.top
     : [];
+  const recentChains = Array.isArray(baseReport?.recentChains) ? baseReport.recentChains : [];
+  const entryRationales = recentChains
+    .map((chain) => {
+      const entry = chain?.entry || {};
+      return {
+        coin: chain?.coin || null,
+        entryIso: entry?.isoTime || null,
+        cloid: entry?.cloid || null,
+        side: entry?.side || null,
+        regime: entry?.regime || null,
+        strategy: entry?.strategy || null,
+        reasonCode: entry?.reasonCode || null,
+        reason: entry?.reason || null,
+        featureSummary: summarizeFeatures(entry?.features || null, 4),
+      };
+    })
+    .filter((x) => x.coin && x.entryIso);
 
   return {
     kind: "daily_summary_v1",
@@ -184,7 +201,8 @@ export function buildDailySummary(baseReport, { dayUtc }) {
       violations: Array.isArray(flip.violations) ? flip.violations : [],
     },
     executionQuality: baseReport?.executionQuality || {},
-    recentChains: Array.isArray(baseReport?.recentChains) ? baseReport.recentChains : [],
+    recentChains,
+    entryRationales,
     dataSources: baseReport?.dataSources || {},
   };
 }
@@ -197,6 +215,30 @@ function fmtBps(value) {
 function fmtPct(v) {
   const n = Number(v);
   return Number.isFinite(n) ? `${(n * 100).toFixed(1)}%` : "n/a";
+}
+
+function summarizeFeatures(featureObj, maxFeatures = 4) {
+  if (!featureObj || typeof featureObj !== "object" || Array.isArray(featureObj)) {
+    return null;
+  }
+  const entries = Object.entries(featureObj)
+    .filter(([, value]) => {
+      const t = typeof value;
+      return t === "number" || t === "boolean" || t === "string";
+    })
+    .slice(0, Math.max(1, Number(maxFeatures || 4)));
+  if (!entries.length) {
+    return null;
+  }
+  return entries.map(([key, value]) => {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const abs = Math.abs(value);
+      if (abs >= 1000) return `${key}=${value.toFixed(2)}`;
+      if (abs >= 10) return `${key}=${value.toFixed(3)}`;
+      return `${key}=${value.toFixed(4)}`;
+    }
+    return `${key}=${String(value)}`;
+  }).join(", ");
 }
 
 export function renderDailySummary(summary) {
@@ -261,6 +303,22 @@ export function renderDailySummary(summary) {
   } else {
     for (const row of top.slice(0, 10)) {
       lines.push(`- ${row.reason}: ${Number(row.count || 0)}`);
+    }
+  }
+  lines.push("");
+
+  lines.push("## Recent Entry Rationales");
+  const rationales = Array.isArray(summary?.entryRationales) ? summary.entryRationales : [];
+  if (!rationales.length) {
+    lines.push("- none");
+  } else {
+    for (const row of rationales.slice(0, 10)) {
+      lines.push(
+        `- ${row.coin} ${row.entryIso || "n/a"} side=${row.side || "n/a"} `
+        + `regime=${row.regime || "n/a"} strategy=${row.strategy || "n/a"} `
+        + `why=${row.reasonCode || row.reason || "n/a"} `
+        + `features=${row.featureSummary || "-"}`,
+      );
     }
   }
   return lines.join("\n");
@@ -361,4 +419,3 @@ if (invokedPath && path.resolve(selfPath) === invokedPath) {
     process.exitCode = 1;
   });
 }
-

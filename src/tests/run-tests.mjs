@@ -583,10 +583,12 @@ async function testDailySummaryFormatting() {
   assert.equal(summary.invariants.B.status, "FAIL", "fixture should fail invariant B");
   assert.equal(summary.conclusion, "STOP_RECOMMENDED", "A/B fail should escalate conclusion");
   assert(summary.tradeAbsenceReasons.top.length >= 1, "absence top reasons should be present");
+  assert(summary.entryRationales.length >= 1, "entry rationales should be present");
 
   const text = renderDailySummary(summary);
   assert(text.includes("Daily Ops Summary"), "daily summary text should include title");
   assert(text.includes("Invariant A"), "daily summary text should include invariants");
+  assert(text.includes("Recent Entry Rationales"), "daily summary text should include rationale section");
 }
 
 async function testPerformanceReportFormats() {

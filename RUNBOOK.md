@@ -166,6 +166,11 @@ bash ops/scripts/daily-summary.sh --day 2026-02-17
 Saved files:
 - `data/reports/YYYY-MM-DD/daily-summary.json`
 - `data/reports/YYYY-MM-DD/daily-summary.md`
+- Both include `Recent Entry Rationales` (entry-time reasonCode/features; no live re-calculation)
+- Inspect example:
+```bash
+jq '.entryRationales[:5]' data/reports/$(date -u -d "yesterday" +%F)/daily-summary.json
+```
 
 Timer status:
 ```bash
