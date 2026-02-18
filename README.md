@@ -43,6 +43,7 @@ npm.cmd run doctor -- --hours 1
 - `ops:performance`: Invariant込みの戦績表示（`table` / `md` / `json`）
 - `ops:daily-summary`: 日次サマリー(JSON + Markdown)の生成
 - `ops:position-why`: 現在ポジションの「なぜ入ったか」を表示（`table` / `md` / `json`）
+- `ops-report`: 日本語寄りの人間向けサマリー（Invariant/ガード/直近チェーン）
 - `selftest`: 署名系セルフテスト
 - `test`: ローテーション/圧縮/保持期限/rollup/schema の単体テスト
 
@@ -210,7 +211,7 @@ npm.cmd run doctor -- --hours 1
 - 実行:
   - `bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto`
 - 出力:
-  - 人間向けサマリ + JSON 1件
+  - 人間向けサマリ（日本語ラベル）+ JSON 1件
 - 監査対象:
   - Invariant A: 未保護ポジション (`NO_PROTECTION`, SL設置遅延)
   - Invariant B: ナンピン/反転順序違反 (`flip_flatten_first -> flip_flat_confirmed -> new entry`)
@@ -241,6 +242,7 @@ npm.cmd run doctor -- --hours 1
   - `bash ops/scripts/position-why.sh --coin BTC --format md`
   - `bash ops/scripts/position-why.sh --format json`
   - `entry_snapshot`（entry時点スナップショット）を優先参照し、現在市況から再計算しない
+  - `why=unknown` を減らすため、`entry_snapshot -> fill_execution_summary -> orders -> execution` の順で理由を補完
 
 ## 16. Ops Sanity Check
 

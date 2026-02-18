@@ -677,6 +677,7 @@ function buildFlipViolations({ timeline, metricsRows, ordersRows }) {
 function buildRecentChains({
   executionRows,
   metricsRows,
+  ordersRows,
   chainLimit,
 }) {
   const entries = executionRows
@@ -697,6 +698,9 @@ function buildRecentChains({
   const entrySnapshots = metricsRows
     .filter((x) => x?.type === "entry_snapshot")
     .sort((a, b) => Number(toTs(a) || 0) - Number(toTs(b) || 0));
+  const entryOrders = (ordersRows || [])
+    .filter((x) => !boolValue(x?.reduceOnly))
+    .sort((a, b) => Number(toTs(a) || 0) - Number(toTs(b) || 0));
 
   const summaryByCloid = new Map();
   for (const row of fillSummaries) {
@@ -710,6 +714,13 @@ function buildRecentChains({
     const cloid = String(row?.cloid || "");
     if (cloid) {
       snapshotByCloid.set(cloid, row);
+    }
+  }
+  const ordersByCloid = new Map();
+  for (const row of entryOrders) {
+    const cloid = String(row?.cloid || "");
+    if (cloid) {
+      ordersByCloid.set(cloid, row);
     }
   }
 
@@ -733,7 +744,16 @@ function buildRecentChains({
       const ts = Number(toTs(x) || 0);
       return Math.abs(ts - entryTs) <= 10_000;
     }) || null;
+    const order = entryCloid
+      ? (ordersByCloid.get(String(entryCloid)) || null)
+      : null;
+    const fallbackOrder = order || entryOrders.find((x) => {
+      if (upperCoin(x?.coin) !== coin) return false;
+      const ts = Number(toTs(x) || 0);
+      return Math.abs(ts - entryTs) <= 10_000;
+    }) || null;
     const features = fallbackSnapshot?.features
+      || fallbackOrder?.explanation?.feature
       || entry?.explanation?.feature
       || null;
     const protectionPlan = fallbackSnapshot?.protectionPlan
@@ -763,15 +783,26 @@ function buildRecentChains({
         taker: boolValue(entry?.taker),
         fillPx: toFiniteNumber(entry?.fillPx, null),
         size: toFiniteNumber(entry?.size, null),
-        regime: entry?.regime || fallbackSnapshot?.regime || null,
-        strategy: entry?.strategy || fallbackSnapshot?.strategy || null,
-        reason: entry?.reason || fallbackSnapshot?.reason || fallbackSummary?.reason || null,
-        reasonCode: fallbackSnapshot?.reasonCode || fallbackSummary?.whyStyle || fallbackSummary?.reason || entry?.reason || null,
+        regime: entry?.regime || fallbackSnapshot?.regime || fallbackOrder?.regime || null,
+        strategy: entry?.strategy || fallbackSnapshot?.strategy || fallbackOrder?.strategy || null,
+        reason: entry?.reason || fallbackSnapshot?.reason || fallbackOrder?.reason || fallbackSummary?.reason || null,
+        reasonCode: fallbackSnapshot?.reasonCode
+          || fallbackSummary?.whyStyle
+          || fallbackSummary?.reason
+          || fallbackOrder?.explanation?.style
+          || fallbackOrder?.reason
+          || fallbackOrder?.strategy
+          || entry?.reason
+          || null,
         features,
         protectionPlan,
         spreadBps: toFiniteNumber(fallbackSummary?.spreadBps, null),
         slippageBps: toFiniteNumber(fallbackSummary?.slippageBps, null),
-        snapshotSource: fallbackSnapshot ? "entry_snapshot" : (fallbackSummary ? "fill_execution_summary" : "execution"),
+        snapshotSource: fallbackSnapshot
+          ? "entry_snapshot"
+          : (fallbackSummary
+            ? "fill_execution_summary"
+            : (fallbackOrder ? "orders" : "execution")),
       },
       protection: protection
         ? {
@@ -999,6 +1030,7 @@ export function analyzeRows({
   const chains = buildRecentChains({
     executionRows,
     metricsRows,
+    ordersRows,
     chainLimit,
   });
 
@@ -1112,49 +1144,104 @@ function formatBps(value) {
   return `${Number(value).toFixed(3)}bps`;
 }
 
+function statusJa(value) {
+  const s = String(value || "").toUpperCase();
+  if (s === "PASS") return "PASS(\u6b63\u5e38)";
+  if (s === "WARN") return "WARN(\u6ce8\u610f)";
+  if (s === "FAIL") return "FAIL(\u7570\u5e38)";
+  return s || "n/a";
+}
+
+const REASON_JA = {
+  NO_TRADE_STALE_DATA: "\u30c7\u30fc\u30bf\u66f4\u65b0\u505c\u6b62",
+  NO_TRADE_REGIME: "\u30ec\u30b8\u30fc\u30e0\u6761\u4ef6\u4e0d\u4e00\u81f4",
+  NO_TRADE_TURBULENCE: "\u6025\u5909\u52d5\u56de\u907f",
+  NO_TRADE_SPREAD: "\u30b9\u30d7\u30ec\u30c3\u30c9\u95be\u5024\u8d85\u904e",
+  NO_TRADE_SLIPPAGE: "\u60f3\u5b9a\u30b9\u30ea\u30c3\u30da\u30fc\u30b8\u8d85\u904e",
+  NO_TRADE_BOOK_MISSING: "\u677f\u60c5\u5831\u4e0d\u8db3",
+  DAILY_TRADE_LIMIT: "\u65e5\u6b21\u7d04\u5b9a\u4e0a\u9650",
+  DAILY_TAKER_LIMIT: "\u65e5\u6b21taker\u4e0a\u9650",
+  TAKER_LIMIT: "taker\u4e0a\u9650",
+  TAKER_STREAK_LIMIT: "\u9023\u7d9ataker\u5236\u9650",
+  cycle_no_signal: "\u30b7\u30b0\u30ca\u30eb\u7121\u3057",
+  book_too_thin: "\u677f\u304c\u8584\u3044",
+  TREND_IMBALANCE_WEAK: "\u677f\u30a4\u30f3\u30d0\u30e9\u30f3\u30b9\u4e0d\u8db3",
+  TREND_FLOW_WEAK: "\u7d04\u5b9a\u30d5\u30ed\u30fc\u5f31\u3044",
+  RANGE_BREAKOUT_RISK: "\u30ec\u30f3\u30b8\u5d29\u308c\u30ea\u30b9\u30af",
+  trend_pullback_continuation: "\u9806\u5f35\u308a\u30d7\u30eb\u30d0\u30c3\u30af\u518d\u958b",
+  range_vwap_reversion: "VWAP\u56de\u5e30\u9006\u5f35\u308a",
+  ttl_taker_attempt: "TTL\u5f8ctaker\u4f8b\u5916",
+  unknown: "\u4e0d\u660e",
+};
+
+function reasonJa(value) {
+  const key = String(value || "");
+  if (!key) return "\u4e0d\u660e";
+  return REASON_JA[key] || key;
+}
+
+function conclusionJa(value) {
+  const v = String(value || "");
+  if (v === "OK") return "OK(\u7d99\u7d9a)";
+  if (v === "WATCH") return "WATCH(\u76e3\u8996)";
+  if (v === "STOP_RECOMMENDED") return "STOP_RECOMMENDED(\u505c\u6b62\u63a8\u5968)";
+  return v || "n/a";
+}
+
+function formatFeatureSummary(features, limit = 3) {
+  if (!features || typeof features !== "object" || Array.isArray(features)) {
+    return "";
+  }
+  return Object.entries(features)
+    .slice(0, Math.max(1, Number(limit || 3)))
+    .map(([k, v]) => `${k}=${typeof v === "number" ? Number(v).toFixed(4) : String(v)}`)
+    .join(", ");
+}
+
 export function renderSummary(report) {
   const lines = [];
-  lines.push(`[ops-report] window: since=${report?.window?.sinceIso || "n/a"} until=${report?.window?.untilIso || "n/a"}`);
+  lines.push(`[ops-report] \u671f\u9593(UTC): ${report?.window?.sinceIso || "n/a"} -> ${report?.window?.untilIso || "n/a"}`);
   if (report?.window?.sinceLabel || report?.window?.untilLabel) {
-    lines.push(`[ops-report] window-label: since="${report?.window?.sinceLabel || ""}" until="${report?.window?.untilLabel || ""}"`);
+    lines.push(`[ops-report] \u5165\u529b\u671f\u9593: since="${report?.window?.sinceLabel || ""}" until="${report?.window?.untilLabel || ""}"`);
   }
 
   const fillsByCoin = report?.fillsByCoin || {};
   const coins = Object.keys(fillsByCoin).sort();
   for (const coin of coins) {
     const row = fillsByCoin[coin];
-    lines.push(`[ops-report] fills ${coin}: total=${row.fills} maker=${row.makerFills} taker=${row.takerFills} maker_ratio=${formatPct(row.makerRatio)}`);
+    lines.push(`[ops-report] \u7d04\u5b9a ${coin}: \u5408\u8a08=${row.fills} maker=${row.makerFills} taker=${row.takerFills} maker\u6bd4\u7387=${formatPct(row.makerRatio)}`);
   }
   if (!coins.length) {
-    lines.push("[ops-report] fills: no execution rows in window");
+    lines.push("[ops-report] \u7d04\u5b9a: \u5bfe\u8c61\u671f\u9593\u306e\u5b9f\u884c\u30c7\u30fc\u30bf\u306a\u3057");
   }
 
   const guards = report?.guardCounts || {};
   const noTradeByReason = guards.noTradeByReason || {};
   const noTradeKeys = Object.keys(noTradeByReason).sort();
   if (noTradeKeys.length) {
+    lines.push("[ops-report] \u30a8\u30f3\u30c8\u30ea\u30fc\u62d2\u5426\u7406\u7531:");
     for (const reason of noTradeKeys) {
-      lines.push(`[ops-report] guard ${reason}: ${noTradeByReason[reason]}`);
+      lines.push(`[ops-report]  - ${reason} (${reasonJa(reason)}): ${noTradeByReason[reason]}`);
     }
   } else {
-    lines.push("[ops-report] guard NO_TRADE_*: none");
+    lines.push("[ops-report] \u30a8\u30f3\u30c8\u30ea\u30fc\u62d2\u5426\u7406\u7531: \u306a\u3057");
   }
-  lines.push(`[ops-report] guard DAILY_TRADE_LIMIT: ${Number(guards.dailyTradeLimitCount || 0)}`);
-  lines.push(`[ops-report] guard DAILY_TAKER_LIMIT: ${Number(guards.dailyTakerLimitCount || 0)} (raw TAKER_LIMIT=${Number(guards.takerLimitCount || 0)})`);
+  lines.push(`[ops-report] \u65e5\u6b21\u7d04\u5b9a\u4e0a\u9650\u30d2\u30c3\u30c8: ${Number(guards.dailyTradeLimitCount || 0)}`);
+  lines.push(`[ops-report] \u65e5\u6b21taker\u4e0a\u9650\u30d2\u30c3\u30c8: ${Number(guards.dailyTakerLimitCount || 0)} (raw TAKER_LIMIT=${Number(guards.takerLimitCount || 0)})`);
 
   const invA = report?.invariants?.A || {};
   const invB = report?.invariants?.B || {};
   const invC = report?.invariants?.C || {};
   const invStatus = report?.invariantStatus || {};
-  lines.push(`[ops-report] invariant A (protected positions): ${invStatus.A || (invA.pass ? "PASS" : "FAIL")} no_protection=${Number(invA.noProtectionIncidentCount || 0)} slow_sl=${Number(invA?.protectionLatencyMs?.violationCount || 0)}`);
-  lines.push(`[ops-report] invariant B (no pyramiding/flip ordering): ${invStatus.B || (invB.pass ? "PASS" : "FAIL")} same_direction_add=${Number(invB.sameDirectionAddCount || 0)} flip_violations=${Number(invB.flipOrderingViolationCount || 0)}`);
-  lines.push(`[ops-report] invariant C (execution quality): ${invStatus.C || (invC.pass ? "PASS" : "FAIL")} taker_threshold_violations=${Number(invC.takerThresholdViolationCount || 0)}`);
-  lines.push(`[ops-report] conclusion: ${String(report?.conclusion || "n/a")}`);
+  lines.push(`[ops-report] Invariant A(\u672a\u4fdd\u8b77\u30dd\u30b8\u7121\u3057): ${statusJa(invStatus.A || (invA.pass ? "PASS" : "FAIL"))} no_protection=${Number(invA.noProtectionIncidentCount || 0)} slow_sl=${Number(invA?.protectionLatencyMs?.violationCount || 0)}`);
+  lines.push(`[ops-report] Invariant B(\u30ca\u30f3\u30d4\u30f3/\u53cd\u8ee2\u9806\u5e8f): ${statusJa(invStatus.B || (invB.pass ? "PASS" : "FAIL"))} same_direction_add=${Number(invB.sameDirectionAddCount || 0)} flip_violations=${Number(invB.flipOrderingViolationCount || 0)}`);
+  lines.push(`[ops-report] Invariant C(\u57f7\u884c\u54c1\u8cea): ${statusJa(invStatus.C || (invC.pass ? "PASS" : "FAIL"))} taker_threshold_violations=${Number(invC.takerThresholdViolationCount || 0)}`);
+  lines.push(`[ops-report] \u7d50\u8ad6: ${conclusionJa(String(report?.conclusion || "n/a"))}`);
 
   const noProtectionIncidents = report?.noProtection?.incidents || [];
   if (noProtectionIncidents.length) {
     const sample = noProtectionIncidents[0];
-    lines.push(`[ops-report] NO_PROTECTION sample: coin=${sample.coin || "n/a"} reason=${sample.reason || "n/a"} cause=${sample.causeCategory || "UNKNOWN"} cloid=${sample.cloid || "n/a"} prev=${sample?.precedingEvent?.type || sample?.precedingEvent?.where || "n/a"}`);
+    lines.push(`[ops-report] NO_PROTECTION \u30b5\u30f3\u30d7\u30eb: coin=${sample.coin || "n/a"} reason=${sample.reason || "n/a"} cause=${sample.causeCategory || "UNKNOWN"} cloid=${sample.cloid || "n/a"} prev=${sample?.precedingEvent?.type || sample?.precedingEvent?.where || "n/a"}`);
   } else {
     lines.push("[ops-report] NO_PROTECTION: 0");
   }
@@ -1166,32 +1253,35 @@ export function renderSummary(report) {
 
   const spread = report?.executionQuality?.spreadBps || {};
   const slippage = report?.executionQuality?.slippageBps || {};
-  lines.push(`[ops-report] spread_bps p50/p90/p99: ${formatBps(spread.p50)} / ${formatBps(spread.p90)} / ${formatBps(spread.p99)}`);
-  lines.push(`[ops-report] slippage_bps p50/p90/p99: ${formatBps(slippage.p50)} / ${formatBps(slippage.p90)} / ${formatBps(slippage.p99)}`);
+  lines.push(`[ops-report] spread_bps \u5206\u5e03 p50/p90/p99: ${formatBps(spread.p50)} / ${formatBps(spread.p90)} / ${formatBps(spread.p99)}`);
+  lines.push(`[ops-report] slippage_bps \u5206\u5e03 p50/p90/p99: ${formatBps(slippage.p50)} / ${formatBps(slippage.p90)} / ${formatBps(slippage.p99)}`);
 
   const topAbsence = report?.tradeAbsenceReasons?.top || [];
   if (topAbsence.length) {
-    lines.push("[ops-report] no-trade/no-signal top reasons:");
+    lines.push("[ops-report] \u53d6\u5f15\u304c\u51fa\u306a\u3044\u4e3b\u56e0 TOP:");
     for (const row of topAbsence.slice(0, 5)) {
-      lines.push(`[ops-report] reason ${row.reason}: ${Number(row.count || 0)}`);
+      lines.push(`[ops-report]  - ${row.reason} (${reasonJa(row.reason)}): ${Number(row.count || 0)}`);
     }
   }
 
   const chains = report?.recentChains || [];
   if (chains.length) {
-    lines.push(`[ops-report] recent chains (latest ${chains.length}):`);
+    lines.push(`[ops-report] \u76f4\u8fd1\u30c1\u30a7\u30fc\u30f3 (${chains.length}\u4ef6):`);
     for (const chain of chains.slice(0, 20)) {
       const p = chain.protection;
       const e = chain.exit;
+      const whyCode = chain.entry.reasonCode || chain.entry.reason || "unknown";
+      const features = formatFeatureSummary(chain.entry.features, 3);
       lines.push(
         `[ops-report] chain ${chain.coin} entry=${chain.entry.isoTime || "n/a"} cloid=${chain.entry.cloid || "n/a"} `
-        + `why=${chain.entry.reasonCode || chain.entry.reason || "n/a"} `
+        + `why=${whyCode}(${reasonJa(whyCode)}) `
+        + `${features ? `features=[${features}] ` : ""}`
         + `protect=${p ? `${p.ok ? "ok" : "ng"}@${p.isoTime || "n/a"}` : "none"} `
         + `exit=${e ? `${e.isoTime || "n/a"}(${e.side || "?"})` : "open"}`,
       );
     }
   } else {
-    lines.push("[ops-report] recent chains: none");
+    lines.push("[ops-report] \u76f4\u8fd1\u30c1\u30a7\u30fc\u30f3: none");
   }
   return lines.join("\n");
 }

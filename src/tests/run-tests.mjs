@@ -566,6 +566,8 @@ async function testOpsAnalyzerInvariantDetection() {
   assert(report.executionQuality.spreadBps.count >= 1, "spread distribution should be populated");
   assert(report.executionQuality.slippageBps.count >= 1, "slippage distribution should be populated");
   assert(report.executionQuality.takerThresholdViolations.length >= 1, "taker threshold violation should be detected");
+  assert(report.recentChains.length >= 1, "recent chains should be populated");
+  assert(String(report.recentChains[0]?.entry?.reasonCode || report.recentChains[0]?.entry?.reason || "").length > 0, "recent chain should include reason");
 }
 
 async function testDailySummaryFormatting() {

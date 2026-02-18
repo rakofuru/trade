@@ -135,6 +135,7 @@ sudo /bin/journalctl -u hlauto --since "10 min ago" --no-pager
 cd /opt/hlauto/trade
 bash ops/scripts/ops-report.sh --since "24 hours ago" --service hlauto
 ```
+- Output is human-oriented with Japanese labels (plus machine JSON).
 
 Summary only:
 ```bash
@@ -205,6 +206,11 @@ bash ops/scripts/position-why.sh --coin BTC --format md
 bash ops/scripts/position-why.sh --format json
 ```
 - `position-why` is based on `entry_snapshot` saved at entry-fill time (no current market re-calculation of reason/features).
+- `ops-report` recent chains also resolve entry reason in this order:
+  - `entry_snapshot`
+  - `fill_execution_summary`
+  - `orders`
+  - `execution`
 
 ## 10. Failure triage
 1. Quick check failed (A/B):
