@@ -45,7 +45,7 @@ find "${APP_DIR}/data" -type d -exec chmod 2775 {} +
 find "${APP_DIR}/data" -type f -exec chmod 0664 {} +
 
 chmod +x "${APP_DIR}/ops/scripts/deploy.sh" "${APP_DIR}/ops/scripts/vps_bootstrap.sh"
-chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh" "${APP_DIR}/ops/scripts/position-why.sh" "${APP_DIR}/ops/scripts/run-bot.sh" "${APP_DIR}/ops/scripts/ops-sanity-check.sh" "${APP_DIR}/ops/scripts/install-systemd-units.sh"
+chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh" "${APP_DIR}/ops/scripts/position-why.sh" "${APP_DIR}/ops/scripts/run-bot.sh" "${APP_DIR}/ops/scripts/ops-sanity-check.sh" "${APP_DIR}/ops/scripts/install-systemd-units.sh" "${APP_DIR}/ops/scripts/finalize-vps.sh"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.service" "/etc/systemd/system/hlauto-daily-summary.service"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.timer" "/etc/systemd/system/hlauto-daily-summary.timer"

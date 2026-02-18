@@ -252,5 +252,10 @@ npm.cmd run doctor -- --hours 1
   - `journalctl` 読み取り可否
   - `data/reports` 書き込み可否
 
+## 17. VPS Finalize (root)
+
+- One-shot permission/unit/sudoers finalize:
+  - `sudo bash /opt/hlauto/trade/ops/scripts/finalize-vps.sh`
+
 - quick check (A/B必須PASS):
   - `bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto --json-only | node ops/assert-invariants.mjs --require A,B`

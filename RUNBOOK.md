@@ -37,6 +37,11 @@ sudo find /opt/hlauto/trade/data -type f -exec chmod 0664 {} +
 chmod +x /opt/hlauto/trade/ops/scripts/deploy.sh /opt/hlauto/trade/ops/scripts/vps_bootstrap.sh
 ```
 
+Quick one-shot finalize (recommended, as root):
+```bash
+sudo bash /opt/hlauto/trade/ops/scripts/finalize-vps.sh
+```
+
 ### 1-2. sudoers for deploy (required)
 Create `/etc/sudoers.d/hlauto-deploy`:
 ```bash
