@@ -29,6 +29,7 @@ id -u "${APP_USER}" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "
 getent group hlauto >/dev/null 2>&1 || groupadd --system hlauto
 id -u hlauto >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash -g hlauto hlauto
 usermod -g hlauto hlauto || true
+usermod -aG hlauto "${APP_USER}" || true
 
 install -d -o "${APP_USER}" -g "${APP_USER}" "$(dirname "${APP_DIR}")"
 
@@ -39,9 +40,12 @@ else
 fi
 
 install -d -o hlauto -g hlauto "${APP_DIR}/data" "${APP_DIR}/data/streams" "${APP_DIR}/data/rollups" "${APP_DIR}/data/state" "${APP_DIR}/data/reports"
+chown -R hlauto:hlauto "${APP_DIR}/data"
+find "${APP_DIR}/data" -type d -exec chmod 2775 {} +
+find "${APP_DIR}/data" -type f -exec chmod 0664 {} +
 
 chmod +x "${APP_DIR}/ops/scripts/deploy.sh" "${APP_DIR}/ops/scripts/vps_bootstrap.sh"
-chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh" "${APP_DIR}/ops/scripts/position-why.sh"
+chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh" "${APP_DIR}/ops/scripts/position-why.sh" "${APP_DIR}/ops/scripts/run-bot.sh" "${APP_DIR}/ops/scripts/ops-sanity-check.sh" "${APP_DIR}/ops/scripts/install-systemd-units.sh"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.service" "/etc/systemd/system/hlauto-daily-summary.service"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.timer" "/etc/systemd/system/hlauto-daily-summary.timer"

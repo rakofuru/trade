@@ -647,6 +647,31 @@ async function testPositionWhyReport() {
         },
       },
     ],
+    lastEntrySnapshotByCoin: [
+      {
+        coin: "BTC",
+        cloid: "0xbtc_entry_1",
+        side: "buy",
+        entryTs: 1700001000500,
+        entryPx: 62010,
+        notional: 620.1,
+        regime: "TREND_UP",
+        strategy: "trend_pullback",
+        reason: "trend_pullback_continuation",
+        reasonCode: "trend_pullback_continuation",
+        features: {
+          pullbackRecovered: true,
+          aggressorRatio: 0.61,
+          imbalance: 0.13,
+        },
+        protectionPlan: {
+          slPct: 0.62,
+          tpPct: 0.81,
+          timeStopMs: 720000,
+          timeStopProgressR: 0.4,
+        },
+      },
+    ],
     lastOpenPositionsByCoin: [
       {
         coin: "BTC",
@@ -669,8 +694,10 @@ async function testPositionWhyReport() {
 
   assert.equal(report.kind, "position_why_v1");
   assert.equal(report.openPositionCount, 1, "open position should be detected");
+  assert.equal(report.feedbackReadyCount, 1, "snapshot-backed reason should be feedback-ready");
   assert.equal(report.positions[0].coin, "BTC");
   assert.equal(report.positions[0].why, "trend_pullback_continuation");
+  assert.equal(report.positions[0].feedbackReady, true, "position should have snapshot");
   assert.equal(report.positions[0].side, "buy");
   assert(report.positions[0].featureSummary.includes("aggressorRatio"), "feature summary should include signal features");
 

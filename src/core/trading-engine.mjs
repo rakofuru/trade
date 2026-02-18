@@ -139,6 +139,7 @@ export class TradingEngine {
     }]));
     this.positionProtectionPlansByCoin = new Map((runtime.positionProtectionPlansByCoin || []).map((x) => [x.coin, x]));
     this.lastEntryContextByCoin = new Map((runtime.lastEntryContextByCoin || []).map((x) => [x.coin, x]));
+    this.lastEntrySnapshotByCoin = new Map((runtime.lastEntrySnapshotByCoin || []).map((x) => [String(x.coin || ""), x]));
     this.lastOpenPositionsByCoin = new Map((runtime.lastOpenPositionsByCoin || []).map((x) => [String(x.coin || ""), x]));
     this.pendingFlipByCoin = new Map((runtime.pendingFlipByCoin || []).map((x) => [x.coin, x]));
     this.recentFlipCompletedByCoin = new Map((runtime.recentFlipCompletedByCoin || []).map((x) => [x.coin, x]));
@@ -820,6 +821,39 @@ export class TradingEngine {
           regime: record?.regime || null,
           explanation: record?.explanation || null,
           dayKey: utcDayKey(record?.fillTime || record?.ts || Date.now()),
+        });
+      }
+
+      if (!isReduceOnly) {
+        const entrySnapshot = {
+          coin,
+          cloid: record?.cloid || null,
+          side: record?.side || null,
+          entryTs: Number(record?.fillTime || record?.ts || Date.now()),
+          entryIso: new Date(Number(record?.fillTime || record?.ts || Date.now())).toISOString(),
+          entryPx: fillPx > 0 ? fillPx : null,
+          notional: notional > 0 ? notional : null,
+          regime: record?.regime || null,
+          strategy: record?.strategy || null,
+          reason: String(record?.reason || record?.strategy || "unknown"),
+          reasonCode: String(record?.explanation?.style || record?.reason || record?.strategy || "unknown"),
+          features: record?.explanation?.feature || null,
+          protectionPlan: plan ? {
+            slPct: Number(plan?.slPct || 0) || null,
+            tpPct: Number(plan?.tpPct || 0) || null,
+            timeStopMs: Number(plan?.timeStopMs || 0) || null,
+            timeStopProgressR: Number(plan?.timeStopProgressR || 0) || null,
+            kind: String(plan?.kind || ""),
+          } : null,
+          maker: Boolean(record?.maker),
+          taker: Boolean(record?.taker),
+          tif: record?.tif || null,
+          dayKey: utcDayKey(record?.fillTime || record?.ts || Date.now()),
+        };
+        this.lastEntrySnapshotByCoin.set(coin, entrySnapshot);
+        this.storage.appendMetric({
+          type: "entry_snapshot",
+          ...entrySnapshot,
         });
       }
 
@@ -1792,6 +1826,11 @@ export class TradingEngine {
     for (const coin of this.lastEntryContextByCoin.keys()) {
       if (!openCoins.has(String(coin))) {
         this.lastEntryContextByCoin.delete(String(coin));
+      }
+    }
+    for (const coin of this.lastEntrySnapshotByCoin.keys()) {
+      if (!openCoins.has(String(coin))) {
+        this.lastEntrySnapshotByCoin.delete(String(coin));
       }
     }
     for (const [coin, row] of this.recentFlipCompletedByCoin.entries()) {
@@ -3704,6 +3743,7 @@ export class TradingEngine {
       })),
       positionProtectionPlansByCoin: Array.from(this.positionProtectionPlansByCoin.values()),
       lastEntryContextByCoin: Array.from(this.lastEntryContextByCoin.values()),
+      lastEntrySnapshotByCoin: Array.from(this.lastEntrySnapshotByCoin.values()),
       lastOpenPositionsByCoin: Array.from(this.lastOpenPositionsByCoin.values()),
       pendingFlipByCoin: Array.from(this.pendingFlipByCoin.values()),
       recentFlipCompletedByCoin: Array.from(this.recentFlipCompletedByCoin.values()),

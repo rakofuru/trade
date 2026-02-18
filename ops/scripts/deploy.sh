@@ -4,6 +4,8 @@ set -euo pipefail
 APP_DIR="${HLAUTO_APP_DIR:-/opt/hlauto/trade}"
 APP_USER="${HLAUTO_APP_USER:-trader}"
 SERVICE_NAME="${HLAUTO_SERVICE_NAME:-hlauto}"
+SUMMARY_SERVICE_NAME="${HLAUTO_SUMMARY_SERVICE_NAME:-hlauto-daily-summary}"
+SKIP_OPS_SANITY="${HLAUTO_SKIP_OPS_SANITY:-0}"
 TARGET_REF="${1:-main}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/bin/systemctl}"
 JOURNALCTL_BIN="${JOURNALCTL_BIN:-/bin/journalctl}"
@@ -147,6 +149,16 @@ fi
 FLATTEN_COUNT="$(grep -Eic 'Flatten position order submitted|tpsl_emergency_flatten|tpsl_unavailable' <<<"${JOURNAL_OUTPUT}" || true)"
 if [[ "${FLATTEN_COUNT}" -ge 3 ]]; then
   fatal "Fatal signal detected: flatten/emergency sequence count=${FLATTEN_COUNT}"
+fi
+
+if [[ "${SKIP_OPS_SANITY}" != "1" ]]; then
+  OPS_SANITY_SCRIPT="${APP_DIR}/ops/scripts/ops-sanity-check.sh"
+  [[ -x "${OPS_SANITY_SCRIPT}" ]] || fatal "ops sanity check script missing or not executable: ${OPS_SANITY_SCRIPT}"
+  echo "[deploy] running ops sanity checks"
+  run_as_app bash "${OPS_SANITY_SCRIPT}" \
+    --app-dir "${APP_DIR}" \
+    --service "${SERVICE_NAME}" \
+    --summary-service "${SUMMARY_SERVICE_NAME}"
 fi
 
 echo "[deploy] SUCCESS sha=${DEPLOYED_SHA} service=${SERVICE_NAME}"

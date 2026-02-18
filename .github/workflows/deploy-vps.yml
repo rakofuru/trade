@@ -151,6 +151,11 @@ jobs:
             set -euo pipefail
             export HLAUTO_APP_DIR="/opt/hlauto/trade"
             export HLAUTO_SERVICE_NAME="hlauto"
+            export HLAUTO_SUMMARY_SERVICE_NAME="hlauto-daily-summary"
+            bash /opt/hlauto/trade/ops/scripts/ops-sanity-check.sh \
+              --app-dir "${HLAUTO_APP_DIR}" \
+              --service "${HLAUTO_SERVICE_NAME}" \
+              --summary-service "${HLAUTO_SUMMARY_SERVICE_NAME}"
             bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
             report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
             printf '%s\n' "${report_json}" >/tmp/hlauto_quick_report.json

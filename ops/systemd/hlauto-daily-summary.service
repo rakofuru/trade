@@ -5,12 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=hlauto
-Group=hlauto
+User=trader
+Group=trader
+SupplementaryGroups=hlauto
 WorkingDirectory=/opt/hlauto/trade
+EnvironmentFile=-/opt/hlauto/trade/.env.local
 Environment=NODE_ENV=production
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/bin/bash /opt/hlauto/trade/ops/scripts/daily-summary.sh --day-offset 1 --summary-only
+UMask=0002
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

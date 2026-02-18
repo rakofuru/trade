@@ -28,6 +28,8 @@ npm.cmd run verify -- --hours 1
 npm.cmd run ops:performance -- --hours 24 --format table
 npm.cmd run ops:daily-summary -- --day-offset 1 --summary-only
 npm.cmd run ops:position-why -- --format table
+npm.cmd run ops:position-why -- --format json
+npm.cmd run ops:sanity
 npm.cmd run selftest
 npm.cmd run test
 npm.cmd run doctor -- --hours 1
@@ -236,6 +238,19 @@ npm.cmd run doctor -- --hours 1
   - `bash ops/scripts/position-why.sh --format table`
   - `bash ops/scripts/position-why.sh --coin BTC --format md`
   - `bash ops/scripts/position-why.sh --format json`
+  - `entry_snapshot`（entry時点スナップショット）を優先参照し、現在市況から再計算しない
+
+## 16. Ops Sanity Check
+
+- deploy後の権限/unit整合チェック:
+  - `bash ops/scripts/ops-sanity-check.sh --app-dir /opt/hlauto/trade --service hlauto --summary-service hlauto-daily-summary`
+- チェック内容:
+  - `hlauto.service` の `User/Group/WorkingDirectory/ExecStart`
+  - `hlauto-daily-summary.service` の `User/Group/WorkingDirectory/ExecStart`
+  - `trader` が `hlauto` group 所属
+  - `data` / `data/reports` の setgid + group write
+  - `journalctl` 読み取り可否
+  - `data/reports` 書き込み可否
 
 - quick check (A/B必須PASS):
   - `bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto --json-only | node ops/assert-invariants.mjs --require A,B`

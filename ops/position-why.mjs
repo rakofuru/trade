@@ -76,7 +76,7 @@ function usage() {
     "  --app-dir <path>       App root (default: cwd)",
     "  --stream-dir <path>    Stream directory (default: <app-dir>/data/streams)",
     "  --state-file <path>    Runtime state file (default: <app-dir>/data/state/runtime-state.json)",
-    "  --hours <n>            Lookback hours for order/execution evidence (default: 168)",
+    "  --hours <n>            Lookback hours for entry snapshot evidence (default: 168)",
     "  --coin <symbol>        Filter by coin (e.g. BTC)",
     "  --format <table|md|json>  Output format (default: table)",
     "  --max-features <n>     Max feature keys in human summary (default: 4)",
@@ -169,14 +169,60 @@ function fmtMaybeNumber(value, digits = 4) {
   return n.toFixed(digits);
 }
 
-function latestByKey(rows, keyFn) {
+function normalizeEntrySnapshot(row) {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+  const coin = toCoin(row?.coin);
+  if (!coin) {
+    return null;
+  }
+  const entryTs = toTs(pickFirst(row.entryTs, row.fillTime, row.ts));
+  return {
+    coin,
+    cloid: row.cloid || null,
+    side: row.side || null,
+    entryTs,
+    entryIso: entryTs ? new Date(entryTs).toISOString() : null,
+    entryPx: finiteNumber(row.entryPx),
+    notional: finiteNumber(row.notional),
+    regime: row.regime || null,
+    strategy: row.strategy || null,
+    reason: String(row.reason || row.strategy || "unknown"),
+    reasonCode: String(row.reasonCode || row.reason || row.strategy || "unknown"),
+    features: row.features || null,
+    protectionPlan: row.protectionPlan || null,
+    maker: Boolean(row.maker),
+    taker: Boolean(row.taker),
+    tif: row.tif || null,
+    dayKey: row.dayKey || null,
+    sourceTs: toTs(row.ts),
+  };
+}
+
+function latestSnapshotMap(rows) {
+  const out = new Map();
+  for (const row of toArray(rows)) {
+    const snap = normalizeEntrySnapshot(row);
+    if (!snap) continue;
+    const prev = out.get(snap.coin);
+    const prevTs = toTs(prev?.entryTs ?? prev?.sourceTs) || 0;
+    const nextTs = toTs(snap?.entryTs ?? snap?.sourceTs) || 0;
+    if (!prev || nextTs >= prevTs) {
+      out.set(snap.coin, snap);
+    }
+  }
+  return out;
+}
+
+function latestByKey(rows, keyFn, tsFn = (row) => toTs(row?.ts ?? row?.fillTime) || 0) {
   const out = new Map();
   for (const row of rows) {
     const key = keyFn(row);
     if (!key) continue;
     const prev = out.get(key);
-    const prevTs = toTs(prev?.ts ?? prev?.fillTime) || 0;
-    const nextTs = toTs(row?.ts ?? row?.fillTime) || 0;
+    const prevTs = prev ? tsFn(prev) : 0;
+    const nextTs = tsFn(row);
     if (!prev || nextTs >= prevTs) {
       out.set(key, row);
     }
@@ -184,10 +230,20 @@ function latestByKey(rows, keyFn) {
   return out;
 }
 
+function pickLatestSnapshot(runtimeSnapshot, metricSnapshot) {
+  if (runtimeSnapshot && metricSnapshot) {
+    const rtTs = toTs(runtimeSnapshot.entryTs ?? runtimeSnapshot.sourceTs) || 0;
+    const mtTs = toTs(metricSnapshot.entryTs ?? metricSnapshot.sourceTs) || 0;
+    return mtTs >= rtTs ? metricSnapshot : runtimeSnapshot;
+  }
+  return metricSnapshot || runtimeSnapshot || null;
+}
+
 export function buildPositionWhyReport({
   runtimeState = {},
   executionRows = [],
   orderRows = [],
+  metricsRows = [],
   coin = null,
   maxFeatures = DEFAULT_MAX_FEATURES,
   nowTs = Date.now(),
@@ -195,11 +251,14 @@ export function buildPositionWhyReport({
   const targetCoin = coin ? toCoin(coin) : null;
   const planByCoin = ensureMapByCoin(runtimeState?.positionProtectionPlansByCoin);
   const entryByCoin = ensureMapByCoin(runtimeState?.lastEntryContextByCoin);
+  const runtimeSnapshotByCoin = latestSnapshotMap(runtimeState?.lastEntrySnapshotByCoin || []);
+  const metricSnapshotByCoin = latestSnapshotMap(
+    toArray(metricsRows).filter((row) => String(row?.type || "") === "entry_snapshot"),
+  );
   const openByCoin = ensureMapByCoin(runtimeState?.lastOpenPositionsByCoin);
 
   const entryExecutions = toArray(executionRows).filter((row) => !Boolean(row?.reduceOnly));
   const entryOrders = toArray(orderRows).filter((row) => !Boolean(row?.reduceOnly));
-
   const execByCloid = latestByKey(entryExecutions, (row) => String(row?.cloid || ""));
   const execByCoin = latestByKey(entryExecutions, (row) => toCoin(row?.coin));
   const orderByCloid = latestByKey(entryOrders, (row) => String(row?.cloid || ""));
@@ -210,6 +269,8 @@ export function buildPositionWhyReport({
   if (coinSet.size === 0) {
     for (const key of planByCoin.keys()) coinSet.add(key);
     for (const key of entryByCoin.keys()) coinSet.add(key);
+    for (const key of runtimeSnapshotByCoin.keys()) coinSet.add(key);
+    for (const key of metricSnapshotByCoin.keys()) coinSet.add(key);
   }
 
   const positions = [];
@@ -217,67 +278,42 @@ export function buildPositionWhyReport({
     if (targetCoin && c !== targetCoin) {
       continue;
     }
-
     const open = openByCoin.get(c) || null;
     const plan = planByCoin.get(c) || null;
     const entry = entryByCoin.get(c) || null;
-    const cloid = String(pickFirst(entry?.cloid, plan?.cloid) || "");
+    const runtimeSnapshot = runtimeSnapshotByCoin.get(c) || null;
+    const metricSnapshot = metricSnapshotByCoin.get(c) || null;
+    const snapshot = pickLatestSnapshot(runtimeSnapshot, metricSnapshot);
+    const snapshotSource = metricSnapshot
+      ? "stream:metrics.entry_snapshot"
+      : (runtimeSnapshot ? "state:lastEntrySnapshotByCoin" : null);
 
+    const cloid = String(pickFirst(snapshot?.cloid, entry?.cloid, plan?.cloid) || "");
     const exec = cloid ? (execByCloid.get(cloid) || null) : null;
     const order = cloid ? (orderByCloid.get(cloid) || null) : null;
     const fallbackExec = exec || execByCoin.get(c) || null;
     const fallbackOrder = order || orderByCoin.get(c) || null;
 
-    const explanation = pickFirst(
-      entry?.explanation,
-      fallbackExec?.explanation,
-      fallbackOrder?.explanation,
-      plan?.explanation,
-    ) || null;
-    const reason = String(pickFirst(
-      entry?.reason,
-      fallbackExec?.reason,
-      fallbackOrder?.reason,
-      plan?.reason,
-      "unknown",
-    ));
-    const strategy = String(pickFirst(
-      entry?.strategy,
-      fallbackExec?.strategy,
-      fallbackOrder?.strategy,
-      plan?.strategy,
-      "unknown",
-    ));
-    const regime = pickFirst(
-      entry?.regime,
-      fallbackExec?.regime,
-      fallbackOrder?.regime,
-      plan?.regime,
-    );
+    const explanation = snapshot?.features
+      ? { style: snapshot.reasonCode, feature: snapshot.features }
+      : (pickFirst(entry?.explanation, fallbackExec?.explanation, fallbackOrder?.explanation, plan?.explanation) || null);
+    const reason = String(pickFirst(snapshot?.reason, entry?.reason, fallbackExec?.reason, fallbackOrder?.reason, plan?.reason, "unknown"));
+    const strategy = String(pickFirst(snapshot?.strategy, entry?.strategy, fallbackExec?.strategy, fallbackOrder?.strategy, plan?.strategy, "unknown"));
+    const regime = pickFirst(snapshot?.regime, entry?.regime, fallbackExec?.regime, fallbackOrder?.regime, plan?.regime);
 
     const size = finiteNumber(open?.size);
-    const entryPx = finiteNumber(pickFirst(
-      entry?.entryPx,
-      plan?.entryPx,
-      fallbackExec?.fillPx,
-      fallbackOrder?.limitPx,
-      open?.entryPx,
-    ));
-    const markPx = finiteNumber(open?.markPx);
-    const unrealizedPnl = finiteNumber(open?.unrealizedPnl);
     const side = inferSide({
-      side: pickFirst(open?.side, entry?.side, fallbackExec?.side, fallbackOrder?.side, plan?.side),
+      side: pickFirst(open?.side, snapshot?.side, entry?.side, fallbackExec?.side, fallbackOrder?.side, plan?.side),
       size,
     });
-    const entryAt = toTs(pickFirst(
-      entry?.fillTime,
-      plan?.entryAt,
-      fallbackExec?.fillTime,
-      fallbackExec?.ts,
-      fallbackOrder?.ts,
-    ));
-    const why = String(pickFirst(explanation?.style, reason, strategy, "unknown"));
-    const featureSummary = summarizeFeatures(explanation?.feature || null, maxFeatures);
+    const entryPx = finiteNumber(pickFirst(snapshot?.entryPx, entry?.entryPx, plan?.entryPx, fallbackExec?.fillPx, fallbackOrder?.limitPx, open?.entryPx));
+    const markPx = finiteNumber(open?.markPx);
+    const unrealizedPnl = finiteNumber(open?.unrealizedPnl);
+    const entryAt = toTs(pickFirst(snapshot?.entryTs, entry?.fillTime, plan?.entryAt, fallbackExec?.fillTime, fallbackExec?.ts, fallbackOrder?.ts));
+
+    const why = String(pickFirst(snapshot?.reasonCode, explanation?.style, reason, strategy, "unknown"));
+    const featureSummary = summarizeFeatures(pickFirst(snapshot?.features, explanation?.feature) || null, maxFeatures);
+    const feedbackReady = Boolean(snapshot?.entryTs && snapshot?.reasonCode);
 
     positions.push({
       coin: c,
@@ -288,20 +324,24 @@ export function buildPositionWhyReport({
       unrealizedPnl,
       entryAt,
       entryIso: entryAt ? new Date(entryAt).toISOString() : null,
-      cloid: pickFirst(entry?.cloid, fallbackExec?.cloid, fallbackOrder?.cloid, plan?.cloid, null),
+      cloid: pickFirst(snapshot?.cloid, entry?.cloid, fallbackExec?.cloid, fallbackOrder?.cloid, plan?.cloid, null),
       regime: regime || null,
       strategy,
       reason,
       why,
+      feedbackReady,
+      snapshotSource,
       featureSummary,
       explanation: explanation || null,
       protection: {
-        slPct: finiteNumber(plan?.slPct),
-        tpPct: finiteNumber(plan?.tpPct),
-        timeStopMs: finiteNumber(plan?.timeStopMs),
+        slPct: finiteNumber(pickFirst(snapshot?.protectionPlan?.slPct, plan?.slPct)),
+        tpPct: finiteNumber(pickFirst(snapshot?.protectionPlan?.tpPct, plan?.tpPct)),
+        timeStopMs: finiteNumber(pickFirst(snapshot?.protectionPlan?.timeStopMs, plan?.timeStopMs)),
+        timeStopProgressR: finiteNumber(pickFirst(snapshot?.protectionPlan?.timeStopProgressR, plan?.timeStopProgressR)),
       },
       evidence: {
         runtimeOpenUpdatedAt: toTs(open?.updatedAt) || null,
+        snapshotTs: toTs(snapshot?.entryTs ?? snapshot?.sourceTs) || null,
         executionTs: toTs(fallbackExec?.ts) || null,
         orderTs: toTs(fallbackOrder?.ts) || null,
       },
@@ -313,6 +353,7 @@ export function buildPositionWhyReport({
     generatedAt: new Date(nowTs).toISOString(),
     status: positions.length ? "HAS_OPEN_POSITION" : "FLAT",
     openPositionCount: positions.length,
+    feedbackReadyCount: positions.filter((x) => Boolean(x?.feedbackReady)).length,
     positions,
   };
 }
@@ -332,7 +373,7 @@ function truncate(text, width) {
 export function renderPositionWhyTable(report) {
   const rows = Array.isArray(report?.positions) ? report.positions : [];
   const lines = [];
-  lines.push(`[position-why] generated_at=${report?.generatedAt || "n/a"} status=${report?.status || "unknown"} open=${rows.length}`);
+  lines.push(`[position-why] generated_at=${report?.generatedAt || "n/a"} status=${report?.status || "unknown"} open=${rows.length} feedback_ready=${Number(report?.feedbackReadyCount || 0)}`);
   if (!rows.length) {
     lines.push("[position-why] no open positions");
     return lines.join("\n");
@@ -345,12 +386,14 @@ export function renderPositionWhyTable(report) {
     padRight("EntryPx", 12),
     padRight("UPnL", 12),
     padRight("Regime", 11),
-    padRight("Strategy", 22),
+    padRight("Strategy", 20),
     padRight("Why", 24),
+    padRight("Snapshot", 9),
     "Features",
   ].join("  ");
   lines.push(header);
-  lines.push("-".repeat(Math.min(160, header.length + 8)));
+  lines.push("-".repeat(Math.min(180, header.length + 8)));
+
   for (const row of rows) {
     lines.push([
       padRight(row.coin || "", 5),
@@ -359,8 +402,9 @@ export function renderPositionWhyTable(report) {
       padRight(fmtMaybeNumber(row.entryPx, 4) || "n/a", 12),
       padRight(fmtMaybeNumber(row.unrealizedPnl, 4) || "n/a", 12),
       padRight(row.regime || "n/a", 11),
-      padRight(truncate(row.strategy || "n/a", 22), 22),
+      padRight(truncate(row.strategy || "n/a", 20), 20),
       padRight(truncate(row.why || "n/a", 24), 24),
+      padRight(row.feedbackReady ? "ready" : "missing", 9),
       truncate(row.featureSummary || "-", 120),
     ].join("  "));
   }
@@ -370,18 +414,20 @@ export function renderPositionWhyTable(report) {
 export function renderPositionWhyMarkdown(report) {
   const rows = Array.isArray(report?.positions) ? report.positions : [];
   const lines = [];
-  lines.push(`# Position Why`);
+  lines.push("# Position Why");
   lines.push("");
   lines.push(`- generatedAt: ${report?.generatedAt || "n/a"}`);
   lines.push(`- status: ${report?.status || "unknown"}`);
   lines.push(`- openPositionCount: ${rows.length}`);
+  lines.push(`- feedbackReadyCount: ${Number(report?.feedbackReadyCount || 0)}`);
   lines.push("");
   if (!rows.length) {
     lines.push("- No open positions");
     return lines.join("\n");
   }
-  lines.push("| Coin | Side | Size | EntryPx | UPNL | Regime | Strategy | Why | Features |");
-  lines.push("| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |");
+
+  lines.push("| Coin | Side | Size | EntryPx | UPNL | Regime | Strategy | Why | Snapshot | Features |");
+  lines.push("| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- |");
   for (const row of rows) {
     lines.push(
       `| ${row.coin || "n/a"}`
@@ -392,6 +438,7 @@ export function renderPositionWhyMarkdown(report) {
       + ` | ${row.regime || "n/a"}`
       + ` | ${row.strategy || "n/a"}`
       + ` | ${row.why || "n/a"}`
+      + ` | ${row.feedbackReady ? "ready" : "missing"}`
       + ` | ${row.featureSummary || "-"} |`,
     );
   }
@@ -414,15 +461,17 @@ async function main() {
   const runtimeState = readJson(stateFile, {});
   const rows = readStreamRows(streamDir, {
     sinceTs,
-    includeStreams: ["execution", "orders"],
+    includeStreams: ["execution", "orders", "metrics"],
   });
   const executionRows = rows.filter((row) => row.__stream === "execution");
   const orderRows = rows.filter((row) => row.__stream === "orders");
+  const metricsRows = rows.filter((row) => row.__stream === "metrics");
 
   const report = buildPositionWhyReport({
     runtimeState,
     executionRows,
     orderRows,
+    metricsRows,
     coin: opts.coin,
     maxFeatures: opts.maxFeatures,
     nowTs,

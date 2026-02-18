@@ -13,6 +13,7 @@
     "ops:daily-summary": "node ops/daily-summary.mjs",
     "ops:performance": "node ops/performance-report.mjs",
     "ops:position-why": "node ops/position-why.mjs",
+    "ops:sanity": "bash ops/scripts/ops-sanity-check.sh",
     "ops:assert-invariants": "node ops/assert-invariants.mjs",
     "verify": "node src/verify.mjs",
     "test": "node src/tests/run-tests.mjs"

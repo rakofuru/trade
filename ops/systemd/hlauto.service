@@ -11,12 +11,13 @@ WorkingDirectory=/opt/hlauto/trade
 EnvironmentFile=/opt/hlauto/trade/.env.local
 Environment=NODE_ENV=production
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/bin/npm run start
+ExecStart=/bin/bash /opt/hlauto/trade/ops/scripts/run-bot.sh
 Restart=always
 RestartSec=10
 TimeoutStopSec=60
 KillSignal=SIGINT
 KillMode=process
+UMask=0002
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=true

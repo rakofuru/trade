@@ -6,6 +6,11 @@ This runbook covers deployment and operations only. Trading logic is out of scop
 - SSH user is `trader` only (key-based auth). No root SSH login.
 - Keep `.env.local` only on VPS. Never commit it.
 - `deploy.sh` runs as `trader`; it uses `sudo` only for `systemctl` and `journalctl`.
+- Unit ownership model (fixed):
+  - `hlauto.service` -> `User=hlauto`, `Group=hlauto`
+  - `hlauto-daily-summary.service` -> `User=trader`, `Group=trader`, `SupplementaryGroups=hlauto`
+  - `data/*` owner/group -> `hlauto:hlauto` with `setgid + g+w`
+- systemd unit source of truth is repo (`ops/systemd/*`). `/etc/systemd/system/*` is generated from repo and may be overwritten.
 - Hard risk stops are immutable. Do not change Daily/Weekly/MDD/Risk-per-trade/Exposure hard limits in ops work.
 - Invariant A/B are priority-1: unprotected position and flip-order violations are never acceptable.
 
@@ -21,11 +26,14 @@ sudo apt-get install -y nodejs
 sudo groupadd --system hlauto || true
 sudo useradd --system --create-home --shell /bin/bash hlauto || true
 sudo usermod -g hlauto hlauto || true
+sudo usermod -aG hlauto trader || true
 sudo mkdir -p /opt/hlauto
 sudo chown -R trader:trader /opt/hlauto
 git clone <YOUR_GITHUB_REPO_URL> /opt/hlauto/trade
 sudo mkdir -p /opt/hlauto/trade/data/{streams,rollups,state,reports}
 sudo chown -R hlauto:hlauto /opt/hlauto/trade/data
+sudo find /opt/hlauto/trade/data -type d -exec chmod 2775 {} +
+sudo find /opt/hlauto/trade/data -type f -exec chmod 0664 {} +
 chmod +x /opt/hlauto/trade/ops/scripts/deploy.sh /opt/hlauto/trade/ops/scripts/vps_bootstrap.sh
 ```
 
@@ -39,11 +47,7 @@ sudo visudo -cf /etc/sudoers.d/hlauto-deploy
 
 ## 2. systemd install
 ```bash
-sudo cp /opt/hlauto/trade/ops/systemd/hlauto.service /etc/systemd/system/hlauto.service
-sudo cp /opt/hlauto/trade/ops/systemd/hlauto-daily-summary.service /etc/systemd/system/hlauto-daily-summary.service
-sudo cp /opt/hlauto/trade/ops/systemd/hlauto-daily-summary.timer /etc/systemd/system/hlauto-daily-summary.timer
-sudo systemctl daemon-reload
-sudo systemctl enable hlauto
+sudo bash /opt/hlauto/trade/ops/scripts/install-systemd-units.sh
 sudo systemctl enable --now hlauto-daily-summary.timer
 ```
 
@@ -103,6 +107,7 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
 Post-deploy checks:
 1. Quick check for last `10 minutes`: fail workflow if Invariant A/B is not PASS.
 2. `24h` summary: warning only (do not fail workflow).
+3. Ops sanity check: unit `User/Group/WorkingDirectory/ExecStart`, `journalctl` readability, and report-dir writability must pass.
 
 ## 5. Rollback
 Deploy a previous commit SHA:
@@ -136,6 +141,11 @@ Quick check A/B:
 bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto --json-only | node ops/assert-invariants.mjs --require A,B
 ```
 
+Ops sanity (permission / unit model):
+```bash
+bash ops/scripts/ops-sanity-check.sh --app-dir /opt/hlauto/trade --service hlauto --summary-service hlauto-daily-summary
+```
+
 ## 8. Daily summary (UTC auto generation)
 One-shot (previous UTC day):
 ```bash
@@ -163,7 +173,10 @@ If `hlauto-daily-summary.service` fails:
 sudo systemctl status hlauto-daily-summary.service --no-pager
 sudo journalctl -u hlauto-daily-summary.service -n 200 --no-pager
 # If permission error appears:
+sudo usermod -aG hlauto trader
 sudo chown -R hlauto:hlauto /opt/hlauto/trade/data
+sudo find /opt/hlauto/trade/data -type d -exec chmod 2775 {} +
+sudo find /opt/hlauto/trade/data -type f -exec chmod 0664 {} +
 sudo systemctl restart hlauto-daily-summary.service
 ```
 
@@ -181,6 +194,7 @@ bash ops/scripts/position-why.sh --format table
 bash ops/scripts/position-why.sh --coin BTC --format md
 bash ops/scripts/position-why.sh --format json
 ```
+- `position-why` is based on `entry_snapshot` saved at entry-fill time (no current market re-calculation of reason/features).
 
 ## 10. Failure triage
 1. Quick check failed (A/B):

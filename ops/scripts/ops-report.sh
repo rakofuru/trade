@@ -55,13 +55,22 @@ UNTIL_EPOCH="$(date -u -d "$UNTIL_SPEC" +%s)"
 
 ANALYZER="$APP_DIR/ops/analyze-ops.mjs"
 STREAM_DIR="$APP_DIR/data/streams"
+JOURNALCTL_BIN="${JOURNALCTL_BIN:-/bin/journalctl}"
+
+run_journalctl() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "${JOURNALCTL_BIN}" "$@"
+  else
+    sudo -n "${JOURNALCTL_BIN}" "$@"
+  fi
+}
 
 if [[ ! -f "$ANALYZER" ]]; then
   echo "[ops-report] analyzer not found: $ANALYZER" >&2
   exit 1
 fi
 
-journalctl --utc -u "$SERVICE" --since "$SINCE_SPEC" --until "$UNTIL_SPEC" --no-pager -o cat \
+run_journalctl --utc -u "$SERVICE" --since "$SINCE_SPEC" --until "$UNTIL_SPEC" --no-pager -o cat \
   | node "$ANALYZER" \
       --stream-dir "$STREAM_DIR" \
       --since-epoch "$SINCE_EPOCH" \
