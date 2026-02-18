@@ -204,6 +204,7 @@ export class FeedbackLoop {
         tif: context.tif || null,
         reduceOnly: Boolean(context.reduceOnly),
         protectionPlan: context.protectionPlan || null,
+        explanation: context.explanation || null,
       };
 
       this.recentExecution.push(executionRecord);

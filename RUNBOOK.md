@@ -22,6 +22,8 @@ sudo useradd --system --create-home --shell /bin/bash hlauto || true
 sudo mkdir -p /opt/hlauto
 sudo chown -R trader:trader /opt/hlauto
 git clone <YOUR_GITHUB_REPO_URL> /opt/hlauto/trade
+sudo mkdir -p /opt/hlauto/trade/data/{streams,rollups,state,reports}
+sudo chown -R hlauto:hlauto /opt/hlauto/trade/data
 chmod +x /opt/hlauto/trade/ops/scripts/deploy.sh /opt/hlauto/trade/ops/scripts/vps_bootstrap.sh
 ```
 
@@ -154,12 +156,28 @@ sudo systemctl status hlauto-daily-summary.timer --no-pager
 sudo systemctl list-timers --all | grep hlauto-daily-summary
 ```
 
+If `hlauto-daily-summary.service` fails:
+```bash
+sudo systemctl status hlauto-daily-summary.service --no-pager
+sudo journalctl -u hlauto-daily-summary.service -n 200 --no-pager
+# If permission error appears:
+sudo chown -R hlauto:hlauto /opt/hlauto/trade/data
+sudo systemctl restart hlauto-daily-summary.service
+```
+
 ## 9. On-demand performance view
 ```bash
 cd /opt/hlauto/trade
 bash ops/scripts/performance-report.sh --hours 24 --format table
 bash ops/scripts/performance-report.sh --since "2026-02-17T00:00:00Z" --until "now" --format md
 bash ops/scripts/performance-report.sh --hours 6 --format json
+```
+
+Current position entry rationale:
+```bash
+bash ops/scripts/position-why.sh --format table
+bash ops/scripts/position-why.sh --coin BTC --format md
+bash ops/scripts/position-why.sh --format json
 ```
 
 ## 10. Failure triage
@@ -181,4 +199,3 @@ bash ops/scripts/performance-report.sh --hours 6 --format json
 - [ ] rollback via `deploy.sh <COMMIT_SHA>` works
 - [ ] quick check enforces Invariant A/B on deploy
 - [ ] daily summary timer is active
-

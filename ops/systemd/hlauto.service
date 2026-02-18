@@ -10,6 +10,7 @@ Group=hlauto
 WorkingDirectory=/opt/hlauto/trade
 EnvironmentFile=/opt/hlauto/trade/.env.local
 Environment=NODE_ENV=production
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/npm run start
 Restart=always
 RestartSec=10

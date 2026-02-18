@@ -9,7 +9,8 @@ User=hlauto
 Group=hlauto
 WorkingDirectory=/opt/hlauto/trade
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node /opt/hlauto/trade/ops/daily-summary.mjs --app-dir /opt/hlauto/trade --day-offset 1 --summary-only
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /opt/hlauto/trade/ops/scripts/daily-summary.sh --day-offset 1 --summary-only
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -17,4 +18,3 @@ ProtectHome=true
 ReadWritePaths=/opt/hlauto/trade/data
 StandardOutput=journal
 StandardError=journal
-

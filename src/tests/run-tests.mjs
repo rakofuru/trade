@@ -25,6 +25,11 @@ import {
   renderPerformanceMarkdown,
   renderPerformanceTable,
 } from "../../ops/performance-report.mjs";
+import {
+  buildPositionWhyReport,
+  renderPositionWhyMarkdown,
+  renderPositionWhyTable,
+} from "../../ops/position-why.mjs";
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "hl-bot-test-"));
@@ -609,6 +614,75 @@ async function testPerformanceReportFormats() {
   assert(markdown.includes("Top No-Trade / No-Signal Reasons"), "markdown output should include reason section");
 }
 
+async function testPositionWhyReport() {
+  const runtimeState = {
+    positionProtectionPlansByCoin: [
+      {
+        coin: "BTC",
+        slPct: 0.62,
+        tpPct: 0.81,
+        entryAt: 1700001000000,
+        entryPx: 62000,
+        reason: "trend_pullback_continuation",
+        strategy: "trend_pullback",
+        regime: "TREND_UP",
+        cloid: "0xbtc_entry_1",
+      },
+    ],
+    lastEntryContextByCoin: [
+      {
+        coin: "BTC",
+        cloid: "0xbtc_entry_1",
+        side: "buy",
+        fillTime: 1700001000500,
+        regime: "TREND_UP",
+        strategy: "trend_pullback",
+        reason: "trend_pullback_continuation",
+        explanation: {
+          style: "trend_pullback_continuation",
+          feature: {
+            pullbackRecovered: true,
+            aggressorRatio: 0.61,
+          },
+        },
+      },
+    ],
+    lastOpenPositionsByCoin: [
+      {
+        coin: "BTC",
+        size: 0.01,
+        side: "buy",
+        entryPx: 62010,
+        markPx: 62100,
+        unrealizedPnl: 0.9,
+        updatedAt: 1700001010000,
+      },
+    ],
+  };
+
+  const report = buildPositionWhyReport({
+    runtimeState,
+    executionRows: [],
+    orderRows: [],
+    nowTs: 1700001015000,
+  });
+
+  assert.equal(report.kind, "position_why_v1");
+  assert.equal(report.openPositionCount, 1, "open position should be detected");
+  assert.equal(report.positions[0].coin, "BTC");
+  assert.equal(report.positions[0].why, "trend_pullback_continuation");
+  assert.equal(report.positions[0].side, "buy");
+  assert(report.positions[0].featureSummary.includes("aggressorRatio"), "feature summary should include signal features");
+
+  const table = renderPositionWhyTable(report);
+  assert(table.includes("BTC"), "table should include coin");
+  assert(table.includes("trend_pullback"), "table should include strategy");
+
+  const markdown = renderPositionWhyMarkdown(report);
+  assert(markdown.includes("| Coin |"), "markdown should include header");
+  assert(markdown.includes("trend_pullback_continuation"), "markdown should include why");
+}
+
 async function main() {
   await testStorageRotation();
   await testLifecycleCompressionAndRetention();
@@ -626,6 +700,7 @@ async function main() {
   await testOpsAnalyzerInvariantDetection();
   await testDailySummaryFormatting();
   await testPerformanceReportFormats();
+  await testPositionWhyReport();
   console.log("All tests passed");
 }
 

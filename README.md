@@ -27,6 +27,7 @@ npm.cmd run report
 npm.cmd run verify -- --hours 1
 npm.cmd run ops:performance -- --hours 24 --format table
 npm.cmd run ops:daily-summary -- --day-offset 1 --summary-only
+npm.cmd run ops:position-why -- --format table
 npm.cmd run selftest
 npm.cmd run test
 npm.cmd run doctor -- --hours 1
@@ -39,6 +40,7 @@ npm.cmd run doctor -- --hours 1
 - `verify`: raw_http の exchange:order エラー検査（時間窓ベース）
 - `ops:performance`: Invariant込みの戦績表示（`table` / `md` / `json`）
 - `ops:daily-summary`: 日次サマリー(JSON + Markdown)の生成
+- `ops:position-why`: 現在ポジションの「なぜ入ったか」を表示（`table` / `md` / `json`）
 - `selftest`: 署名系セルフテスト
 - `test`: ローテーション/圧縮/保持期限/rollup/schema の単体テスト
 
@@ -229,6 +231,11 @@ npm.cmd run doctor -- --hours 1
   - `bash ops/scripts/performance-report.sh --hours 24 --format table`
   - `bash ops/scripts/performance-report.sh --since "2026-02-17T00:00:00Z" --until "now" --format md`
   - `bash ops/scripts/performance-report.sh --hours 6 --format json`
+
+- 現在ポジションのエントリー根拠表示:
+  - `bash ops/scripts/position-why.sh --format table`
+  - `bash ops/scripts/position-why.sh --coin BTC --format md`
+  - `bash ops/scripts/position-why.sh --format json`
 
 - quick check (A/B必須PASS):
   - `bash ops/scripts/ops-report.sh --since "10 minutes ago" --service hlauto --json-only | node ops/assert-invariants.mjs --require A,B`

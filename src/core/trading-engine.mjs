@@ -139,6 +139,7 @@ export class TradingEngine {
     }]));
     this.positionProtectionPlansByCoin = new Map((runtime.positionProtectionPlansByCoin || []).map((x) => [x.coin, x]));
     this.lastEntryContextByCoin = new Map((runtime.lastEntryContextByCoin || []).map((x) => [x.coin, x]));
+    this.lastOpenPositionsByCoin = new Map((runtime.lastOpenPositionsByCoin || []).map((x) => [String(x.coin || ""), x]));
     this.pendingFlipByCoin = new Map((runtime.pendingFlipByCoin || []).map((x) => [x.coin, x]));
     this.recentFlipCompletedByCoin = new Map((runtime.recentFlipCompletedByCoin || []).map((x) => [x.coin, x]));
     this.globalNoTradeReason = runtime.globalNoTradeReason || null;
@@ -813,6 +814,11 @@ export class TradingEngine {
           entryPx: fillPx > 0 ? fillPx : Number(plan?.entryPx || 0),
           entryAt: Number(record?.fillTime || record?.ts || Date.now()),
           reason: String(record?.reason || plan?.kind || "strategy"),
+          cloid: record?.cloid || null,
+          side: record?.side || null,
+          strategy: record?.strategy || null,
+          regime: record?.regime || null,
+          explanation: record?.explanation || null,
           dayKey: utcDayKey(record?.fillTime || record?.ts || Date.now()),
         });
       }
@@ -832,6 +838,7 @@ export class TradingEngine {
         regime: record?.regime || null,
         slPct: Number(plan?.slPct || 0) || null,
         tpPct: Number(plan?.tpPct || 0) || null,
+        whyStyle: String(record?.explanation?.style || record?.reason || record?.strategy || "unknown"),
         reason: String(record?.reason || record?.strategy || "unknown"),
       });
 
@@ -844,6 +851,12 @@ export class TradingEngine {
           regime: record?.regime || null,
           strategy: record?.strategy || null,
           reason: String(record?.reason || record?.strategy || "unknown"),
+          entryPx: fillPx > 0 ? fillPx : null,
+          notional: notional > 0 ? notional : null,
+          maker: Boolean(record?.maker),
+          taker: Boolean(record?.taker),
+          tif: record?.tif || null,
+          explanation: record?.explanation || null,
           dayKey: utcDayKey(record?.fillTime || record?.ts || Date.now()),
         };
         latestEntryContextByCoin.set(coin, entryCtx);
@@ -1728,6 +1741,23 @@ export class TradingEngine {
     const dailyPnl = executionRows.reduce((acc, row) => acc + Number(row?.realizedPnl || 0), 0);
     const drawdownBps = Number(this.feedback.currentMetrics()?.drawdownBps || 0);
     const openPositions = summarizeOpenPositions(this.lastUserState || {});
+    this.lastOpenPositionsByCoin = new Map(
+      openPositions.map((pos) => {
+        const coin = String(pos?.coin || "");
+        return [
+          coin,
+          {
+            coin,
+            size: Number(pos?.size || 0),
+            side: Number(pos?.size || 0) >= 0 ? "buy" : "sell",
+            entryPx: Number(pos?.entryPx || 0),
+            markPx: Number(pos?.markPx || 0),
+            unrealizedPnl: Number(pos?.unrealizedPnl || 0),
+            updatedAt: now,
+          },
+        ];
+      }).filter((x) => x[0]),
+    );
     const positionNotional = inventoryNotional(this.lastUserState || {});
     const openOrders = this.openOrders.size;
     const openCoins = new Set(openPositions.map((p) => String(p.coin || "")));
@@ -3674,6 +3704,7 @@ export class TradingEngine {
       })),
       positionProtectionPlansByCoin: Array.from(this.positionProtectionPlansByCoin.values()),
       lastEntryContextByCoin: Array.from(this.lastEntryContextByCoin.values()),
+      lastOpenPositionsByCoin: Array.from(this.lastOpenPositionsByCoin.values()),
       pendingFlipByCoin: Array.from(this.pendingFlipByCoin.values()),
       recentFlipCompletedByCoin: Array.from(this.recentFlipCompletedByCoin.values()),
       globalNoTradeReason: this.globalNoTradeReason,

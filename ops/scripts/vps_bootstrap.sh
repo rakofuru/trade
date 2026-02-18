@@ -36,8 +36,10 @@ else
   echo "[bootstrap] repository already exists at ${APP_DIR}"
 fi
 
+install -d -o hlauto -g hlauto "${APP_DIR}/data" "${APP_DIR}/data/streams" "${APP_DIR}/data/rollups" "${APP_DIR}/data/state" "${APP_DIR}/data/reports"
+
 chmod +x "${APP_DIR}/ops/scripts/deploy.sh" "${APP_DIR}/ops/scripts/vps_bootstrap.sh"
-chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh"
+chmod +x "${APP_DIR}/ops/scripts/ops-report.sh" "${APP_DIR}/ops/scripts/daily-summary.sh" "${APP_DIR}/ops/scripts/performance-report.sh" "${APP_DIR}/ops/scripts/position-why.sh"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.service" "/etc/systemd/system/hlauto-daily-summary.service"
 install -m 0644 "${APP_DIR}/ops/systemd/hlauto-daily-summary.timer" "/etc/systemd/system/hlauto-daily-summary.timer"
