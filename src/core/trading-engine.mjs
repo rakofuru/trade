@@ -335,6 +335,11 @@ export class TradingEngine {
       openPositions: 0,
       positionNotional: 0,
     };
+    this.manualGlobalPauseUntil = Math.max(0, Number(runtime.manualGlobalPauseUntil || 0));
+    this.manualGlobalPauseReason = String(runtime.manualGlobalPauseReason || "");
+    this.lastAskQuestionAt = Math.max(0, Number(runtime.lastAskQuestionAt || 0));
+    this.lastAskQuestionFingerprint = String(runtime.lastAskQuestionFingerprint || "");
+    this.askQuestionDispatcher = null;
     if (Array.isArray(runtime.selectedCoins) && runtime.selectedCoins.length) {
       this.selectedCoins = runtime.selectedCoins;
     }
@@ -376,6 +381,123 @@ export class TradingEngine {
     this.#logNextSteps();
 
     return this.stopPromise;
+  }
+
+  setAskQuestionDispatcher(dispatcher) {
+    this.askQuestionDispatcher = typeof dispatcher === "function" ? dispatcher : null;
+  }
+
+  async handleOperatorDecision(command, context = {}) {
+    const action = String(command?.action || "").toUpperCase();
+    const coin = String(command?.coin || "ALL").toUpperCase();
+    const reason = String(command?.reason || "line_operator_decision");
+    const ttlSecRaw = Number(command?.ttlSec);
+    const ttlSec = Number.isFinite(ttlSecRaw) && ttlSecRaw >= 0
+      ? Math.min(86400, Math.floor(ttlSecRaw))
+      : 300;
+    const until = ttlSec > 0
+      ? (Date.now() + (ttlSec * 1000))
+      : Number.MAX_SAFE_INTEGER;
+
+    this.storage.appendMetric({
+      type: "operator_decision_received",
+      action,
+      coin,
+      ttlSec,
+      source: context?.source || "line",
+      userId: context?.userId || null,
+      reason,
+    });
+
+    if (action === "PAUSE") {
+      if (coin === "ALL") {
+        this.manualGlobalPauseUntil = until;
+        this.manualGlobalPauseReason = reason;
+      } else {
+        this.strategyBlockedCoins.set(coin, {
+          until,
+          reason: "manual_pause_line",
+          dayKey: utcDayKey(Date.now()),
+        });
+      }
+      return {
+        ok: true,
+        message: `${coin} を一時停止しました (ttl=${ttlSec}s)`,
+      };
+    }
+
+    if (action === "RESUME") {
+      if (coin === "ALL") {
+        this.manualGlobalPauseUntil = 0;
+        this.manualGlobalPauseReason = "";
+      } else {
+        this.strategyBlockedCoins.delete(coin);
+      }
+      return {
+        ok: true,
+        message: `${coin} の一時停止を解除しました`,
+      };
+    }
+
+    if (action === "FLATTEN") {
+      await this.#flattenAllPositions();
+      await this.#refreshRiskSnapshot(true);
+      return {
+        ok: true,
+        message: "ポジションのフラット化を実行しました",
+      };
+    }
+
+    if (action === "CANCEL_ORDERS") {
+      await this.cancelAllOpenOrders({ strict: true });
+      await this.#refreshRiskSnapshot(true);
+      return {
+        ok: true,
+        message: "未約定注文キャンセルを実行しました",
+      };
+    }
+
+    if (action === "REJECT") {
+      if (coin === "ALL") {
+        this.manualGlobalPauseUntil = until;
+        this.manualGlobalPauseReason = reason || "manual_reject";
+      } else {
+        this.strategyBlockedCoins.set(coin, {
+          until,
+          reason: "manual_reject_line",
+          dayKey: utcDayKey(Date.now()),
+        });
+      }
+      return {
+        ok: true,
+        message: `${coin} をREJECTとしてブロックしました (ttl=${ttlSec}s)`,
+      };
+    }
+
+    if (action === "APPROVE") {
+      if (coin === "ALL") {
+        this.manualGlobalPauseUntil = 0;
+        this.manualGlobalPauseReason = "";
+      } else {
+        this.strategyBlockedCoins.delete(coin);
+      }
+      return {
+        ok: true,
+        message: `${coin} APPROVE を記録しました`,
+      };
+    }
+
+    if (action === "CUSTOM") {
+      return {
+        ok: true,
+        message: "CUSTOM を受理しました（自動執行なし）",
+      };
+    }
+
+    return {
+      ok: false,
+      message: `未対応 action: ${action}`,
+    };
   }
 
   async requestShutdown(reason, error = null, options = {}) {
@@ -1232,6 +1354,16 @@ export class TradingEngine {
     this.#assertRiskWithinLimits();
     await this.#syncPositionTpSl();
 
+    if (this.manualGlobalPauseUntil > Date.now()) {
+      this.storage.appendMetric({
+        type: "manual_pause_active",
+        scope: "global",
+        until: this.manualGlobalPauseUntil,
+        reason: this.manualGlobalPauseReason || "manual_pause_line",
+      });
+      return;
+    }
+
     const decision = this.#selectBestSignal();
     if (!decision || !decision.signal) {
       this.storage.appendMetric({
@@ -1246,6 +1378,12 @@ export class TradingEngine {
         type: "cycle_blocked",
         cycle: this.cycleCounter,
         decision,
+      });
+      await this.#maybeDispatchAskQuestion({
+        phase: "cycle_blocked",
+        decision,
+        reason: decision.signal.reason || "signal_blocked",
+        detail: decision.signal?.explanation?.feature || null,
       });
       return;
     }
@@ -1625,6 +1763,12 @@ export class TradingEngine {
         armId: arm.id,
         strategy: arm.strategy,
       }));
+      await this.#maybeDispatchAskQuestion({
+        phase: "entry_guard_block",
+        decision,
+        reason: entryGuard.reason || "entry_guard_block",
+        detail: entryGuard.detail || null,
+      });
       return {
         submitted: false,
         nonError: true,
@@ -4185,6 +4329,104 @@ export class TradingEngine {
     }
   }
 
+  async #maybeDispatchAskQuestion({
+    phase,
+    decision = null,
+    reason = "unspecified",
+    detail = null,
+  } = {}) {
+    if (!this.config.lineAskQuestionEnabled || !this.askQuestionDispatcher) {
+      return;
+    }
+
+    const now = Date.now();
+    const cooldownMs = Math.max(30_000, Number(this.config.lineAskQuestionCooldownMs || 300000));
+    if ((now - this.lastAskQuestionAt) < cooldownMs) {
+      return;
+    }
+
+    const coin = String(decision?.coin || decision?.signal?.coin || "ALL").toUpperCase();
+    const regime = String(decision?.regime || decision?.signal?.regime || "unknown");
+    const signalSummary = String(
+      decision?.signal?.reason
+      || decision?.signal?.explanation?.style
+      || reason
+      || "unknown",
+    );
+    const fingerprint = crypto
+      .createHash("sha1")
+      .update([phase, coin, regime, reason, signalSummary].join("|"))
+      .digest("hex");
+    if (fingerprint === this.lastAskQuestionFingerprint && (now - this.lastAskQuestionAt) < (cooldownMs * 3)) {
+      return;
+    }
+
+    const openPositions = summarizeOpenPositions(this.lastUserState || {});
+    const coinPosition = openPositions.find((x) => String(x?.coin || "").toUpperCase() === coin) || null;
+    const questionId = `ask_${now}_${coin.toLowerCase()}`;
+    const options = [];
+    const side = String(decision?.signal?.side || "").toLowerCase();
+    if (side === "buy") {
+      options.push("ENTER_LONG", "HOLD", "REDUCE", "EXIT");
+    } else if (side === "sell") {
+      options.push("ENTER_SHORT", "HOLD", "REDUCE", "EXIT");
+    } else {
+      options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
+    }
+
+    const dilemmas = [
+      `reason=${String(reason || "unknown")}`,
+      `phase=${String(phase || "unknown")}`,
+      detail && typeof detail === "object"
+        ? JSON.stringify(detail).slice(0, 180)
+        : String(detail || ""),
+    ].filter(Boolean).slice(0, 3);
+
+    const payload = {
+      questionId,
+      ts: now,
+      coin,
+      midPx: Number(this.marketData.mid(coin) || 0),
+      positionSize: Number(coinPosition?.size || 0),
+      positionSide: Number(coinPosition?.size || 0) > 0
+        ? "long"
+        : (Number(coinPosition?.size || 0) < 0 ? "short" : "flat"),
+      openOrders: Number(this.riskSnapshot?.openOrders || this.openOrders.size || 0),
+      dailyPnlUsd: Number(this.riskSnapshot?.dailyPnl || 0),
+      drawdownBps: Number(this.riskSnapshot?.drawdownBps || 0),
+      regime,
+      signalSummary,
+      dilemmas,
+      options,
+    };
+
+    try {
+      const result = await this.askQuestionDispatcher(payload);
+      this.lastAskQuestionAt = now;
+      this.lastAskQuestionFingerprint = fingerprint;
+      this.storage.appendMetric({
+        type: "ask_question_dispatched",
+        questionId,
+        coin,
+        phase,
+        reason,
+        sent: Boolean(result?.sent),
+      });
+    } catch (error) {
+      this.storage.appendError({
+        where: "ask_question_dispatch",
+        questionId,
+        coin,
+        error: error.message,
+      });
+      this.logger.warn("AskQuestion dispatch failed", {
+        questionId,
+        coin,
+        error: error.message,
+      });
+    }
+  }
+
   async #runReportingLoop() {
     const now = Date.now();
 
@@ -4344,6 +4586,10 @@ export class TradingEngine {
       lastLifecycleAt: this.lastLifecycleAt,
       selectedCoins: this.selectedCoins,
       riskSnapshot: this.riskSnapshot,
+      manualGlobalPauseUntil: this.manualGlobalPauseUntil,
+      manualGlobalPauseReason: this.manualGlobalPauseReason,
+      lastAskQuestionAt: this.lastAskQuestionAt,
+      lastAskQuestionFingerprint: this.lastAskQuestionFingerprint,
       savedAt: new Date().toISOString(),
     };
 
@@ -4404,6 +4650,13 @@ export class TradingEngine {
   }
 
   #isCoinBlockedForTrading(coin) {
+    if (this.manualGlobalPauseUntil > Date.now()) {
+      return true;
+    }
+    if (this.manualGlobalPauseUntil > 0 && Date.now() >= this.manualGlobalPauseUntil) {
+      this.manualGlobalPauseUntil = 0;
+      this.manualGlobalPauseReason = "";
+    }
     const guard = this.strategyBlockedCoins.get(String(coin));
     if (guard && Number(guard.until || 0) > 0) {
       if (Date.now() < Number(guard.until)) {

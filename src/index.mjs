@@ -5,6 +5,7 @@ import { BudgetManager, BudgetExceededError } from "./core/budget-manager.mjs";
 import { HyperliquidHttpClient } from "./hyperliquid/client.mjs";
 import { TradingEngine } from "./core/trading-engine.mjs";
 import { GptAdvisor } from "./core/gpt-advisor.mjs";
+import { LineOpsBridge } from "./line/line-ops-bridge.mjs";
 
 function toError(input) {
   if (input instanceof Error) {
@@ -55,9 +56,20 @@ async function main() {
     storage,
     gptAdvisor,
   });
+  const lineBridge = new LineOpsBridge({
+    config,
+    logger,
+    storage,
+    onDecision: async (command, context) => engine.handleOperatorDecision(command, {
+      ...context,
+      source: "line",
+    }),
+  });
+  engine.setAskQuestionDispatcher(async (payload) => lineBridge.sendAskQuestion(payload));
 
   const shutdown = async (reason) => {
     await engine.requestShutdown(reason);
+    await lineBridge.stop();
   };
 
   let fatalInProgress = false;
@@ -77,6 +89,9 @@ async function main() {
     ).catch((shutdownError) => {
       logger.error("Fatal shutdown failed", { kind, error: shutdownError.message });
     }).finally(() => {
+      lineBridge.stop().catch((stopError) => {
+        logger.error("Line bridge stop failed", { kind, error: stopError.message });
+      });
       process.exitCode = 1;
     });
   };
@@ -102,6 +117,7 @@ async function main() {
   });
 
   try {
+    await lineBridge.start();
     await engine.init();
 
     if (config.budgetMode === "quota") {
@@ -115,16 +131,19 @@ async function main() {
 
     const result = await engine.start();
     logger.info("Engine stopped", result);
+    await lineBridge.stop();
   } catch (error) {
     if (error instanceof BudgetExceededError) {
       logger.warn("Budget exceeded during startup", { reason: error.message, details: error.details });
       await engine.requestShutdown(error.message, error);
+      await lineBridge.stop();
       return;
     }
 
     logger.error("Fatal startup error", { error: error.message, stack: error.stack });
     try {
       await engine.requestShutdown("fatal_error", error, { createKillSwitch: true });
+      await lineBridge.stop();
     } catch {
       // no-op
     }

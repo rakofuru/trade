@@ -62,6 +62,19 @@ cp /opt/hlauto/trade/.env.local.example /opt/hlauto/trade/.env.local
 nano /opt/hlauto/trade/.env.local
 ```
 
+LINE webhook env (if using human-in-the-loop):
+```bash
+LINE_CHANNEL_ID=...
+LINE_CHANNEL_SECRET=...
+LINE_CHANNEL_ACCESS_TOKEN=...
+PUBLIC_BASE_URL=https://<your-domain>
+LINE_WEBHOOK_PATH=/line/webhook
+LINE_WEBHOOK_PORT=8787
+LINE_ALLOWED_USER_IDS=Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+- LINE Developers の Webhook URL は `PUBLIC_BASE_URL + LINE_WEBHOOK_PATH` を設定
+- 受信経路（reverse proxy / firewall）で `LINE_WEBHOOK_PORT` まで到達できることを確認
+
 First deploy:
 ```bash
 cd /opt/hlauto/trade
@@ -135,6 +148,18 @@ sudo /bin/journalctl -u hlauto -n 200 --no-pager
 sudo /bin/journalctl -u hlauto --since "10 min ago" --no-pager
 ```
 
+LINE webhook diagnostics:
+```bash
+# env反映確認（値そのものは出さない）
+sudo systemctl show hlauto --property=Environment --no-pager | sed 's/ /\n/g' | grep '^LINE_'
+
+# webhook listener確認
+sudo ss -lntp | grep ':8787'
+
+# 直近LINEイベントの確認
+sudo /bin/journalctl -u hlauto -n 200 --no-pager | grep -E 'line_webhook|line_command|ask_question|LINE'
+```
+
 Emergency stop (kill switch file):
 ```bash
 touch /opt/hlauto/trade/data/state/KILL_SWITCH
@@ -157,6 +182,10 @@ Runtime guardrails (always-on):
 - Daily loss window: `DAILY_LOSS_MODE=utc_day|rolling24h` (default `utc_day`) controls realized PnL day-start.
 - Shutdown cleanup retry: cancel/flatten retries (`SHUTDOWN_CLEANUP_MAX_RETRIES`, `SHUTDOWN_CLEANUP_BACKOFF_BASE_MS`).
 - Stability fail action default is `STABILITY_FAIL_ACTION=shutdown` (fail-open禁止).
+- LINE webhook security: `X-Line-Signature` を `LINE_CHANNEL_SECRET` で検証
+- LINE operator allowlist: `LINE_ALLOWED_USER_IDS` 以外は拒否
+- LINE command format: `BOT_DECISION_V1` + key=value のみ解釈（自由文は無視）
+- LINE actions: `APPROVE / REJECT / PAUSE / RESUME / FLATTEN / CANCEL_ORDERS / CUSTOM`
 
 ## 7. Invariant report (on-demand)
 ```bash
@@ -250,6 +279,16 @@ bash ops/scripts/position-why.sh --format json
 3. Daily timer failed:
    - `sudo journalctl -u hlauto-daily-summary.service -n 200 --no-pager`
    - `sudo systemctl daemon-reload && sudo systemctl restart hlauto-daily-summary.timer`
+4. LINEが届かない:
+   - `LINE_CHANNEL_ACCESS_TOKEN` の未設定/期限切れを確認
+   - channel側のWebhook有効化とURL（`PUBLIC_BASE_URL + LINE_WEBHOOK_PATH`）を確認
+   - `LINE_ALLOWED_USER_IDS` に運用者 `userId` が入っているか確認
+5. 署名エラー:
+   - `line_webhook_rejected reason=signature_invalid` が出る場合は `LINE_CHANNEL_SECRET` 不一致
+   - reverse proxy等でrequest bodyを書き換えていないか確認
+6. allowlist拒否:
+   - `line_webhook_rejected reason=allowlist_denied` を確認
+   - 友だち追加済み運用者の `userId` を `LINE_ALLOWED_USER_IDS` に追加
 
 ## 11. Self-audit checklist
 - [ ] `.env.local` is not committed

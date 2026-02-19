@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -38,6 +39,10 @@ import {
   renderPositionWhyMarkdown,
   renderPositionWhyTable,
 } from "../../ops/position-why.mjs";
+import { parseBotDecisionMessage } from "../line/decision-parser.mjs";
+import { verifyLineSignature } from "../line/signature.mjs";
+import { buildAskQuestionMessage } from "../line/ask-question.mjs";
+import { isLineUserAllowed } from "../line/line-ops-bridge.mjs";
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "hl-bot-test-"));
@@ -590,6 +595,80 @@ async function testWsWatchdogTrigger() {
     false,
     "watchdog should not fire without first message timestamp",
   );
+}
+
+async function testLineSignatureVerification() {
+  const rawBody = JSON.stringify({ events: [{ type: "message", message: { type: "text", text: "hi" } }] });
+  const secret = "test_line_secret";
+  const signature = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
+  assert.equal(
+    verifyLineSignature({
+      channelSecret: secret,
+      rawBody,
+      signature,
+    }),
+    true,
+    "valid LINE signature should pass",
+  );
+  assert.equal(
+    verifyLineSignature({
+      channelSecret: secret,
+      rawBody,
+      signature: "invalid",
+    }),
+    false,
+    "invalid LINE signature should fail",
+  );
+}
+
+async function testLineDecisionTemplateParsing() {
+  const valid = parseBotDecisionMessage([
+    "BOT_DECISION_V1",
+    "action=PAUSE",
+    "coin=BTC",
+    "size=0.01",
+    "reason=need_review",
+    "ttl_sec=300",
+  ].join("\n"));
+  assert.equal(valid.ok, true, "valid decision template should parse");
+  assert.equal(valid.command.action, "PAUSE");
+  assert.equal(valid.command.coin, "BTC");
+  assert.equal(Number(valid.command.size), 0.01);
+  assert.equal(Number(valid.command.ttlSec), 300);
+
+  const invalid = parseBotDecisionMessage([
+    "BOT_DECISION_V1",
+    "action=DO_SOMETHING",
+  ].join("\n"));
+  assert.equal(invalid.ok, false, "invalid action should be rejected");
+  assert.equal(invalid.error, "invalid_action");
+}
+
+async function testLineAllowlistRejection() {
+  const allow = new Set(["U_ALLOW_1", "U_ALLOW_2"]);
+  assert.equal(isLineUserAllowed("U_ALLOW_1", allow), true, "allowlisted user should pass");
+  assert.equal(isLineUserAllowed("U_DENY_1", allow), false, "non-allowlisted user should be rejected");
+}
+
+async function testAskQuestionPayloadFormatting() {
+  const text = buildAskQuestionMessage({
+    questionId: "ask_test_1",
+    coin: "BTC",
+    midPx: 101234.56,
+    positionSize: 0.01,
+    positionSide: "long",
+    openOrders: 2,
+    dailyPnlUsd: 12.34,
+    drawdownBps: 45.6,
+    regime: "TREND_UP",
+    signalSummary: "breakout_minEdge_borderline",
+    dilemmas: ["edge不足気味", "ボラ上昇中", "一時見送りか"],
+    options: ["ENTER_LONG", "HOLD", "REDUCE"],
+  });
+  assert(text.includes("A) 状況サマリ"), "ask question text should include section A");
+  assert(text.includes("D) ChatGPT貼り付け用プロンプト"), "ask question text should include prompt block");
+  assert(text.includes("E) LINE返信テンプレ"), "ask question text should include reply template");
+  assert(text.includes("BOT_DECISION_V1"), "reply template header should be embedded");
 }
 
 async function testStrategyTrendBreakoutSignal() {
@@ -1407,6 +1486,10 @@ async function main() {
   await testTpSlOrderRequestSideAndZeroSize();
   await testDailyLossWindowModes();
   await testWsWatchdogTrigger();
+  await testLineSignatureVerification();
+  await testLineDecisionTemplateParsing();
+  await testLineAllowlistRejection();
+  await testAskQuestionPayloadFormatting();
   await testStrategyTrendBreakoutSignal();
   await testStrategyRangeBlocksOnHighVol();
   await testStrategyEntryPacingLimitPerHour();

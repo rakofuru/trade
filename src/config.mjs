@@ -66,6 +66,16 @@ function parseCsv(value, fallbackCsv) {
     .filter(Boolean);
 }
 
+function parseOptionalCsv(value) {
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
+  return String(value)
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
 function parseMode(value, allowed, fallback) {
   const normalized = String(value || fallback).toLowerCase();
   if (!allowed.includes(normalized)) {
@@ -291,6 +301,16 @@ export function loadConfig(cwd = process.cwd()) {
     streamDir: env.STREAM_DIR || path.join(cwd, "data", "streams"),
     rollupDir: env.ROLLUP_DIR || path.join(cwd, "data", "rollups"),
     runtimeKillSwitchFile: env.RUNTIME_KILL_SWITCH_FILE || path.join(stateDir, "KILL_SWITCH"),
+    lineChannelId: env.LINE_CHANNEL_ID || "",
+    lineChannelSecret: env.LINE_CHANNEL_SECRET || "",
+    lineChannelAccessToken: env.LINE_CHANNEL_ACCESS_TOKEN || "",
+    publicBaseUrl: env.PUBLIC_BASE_URL || "",
+    lineWebhookPath: env.LINE_WEBHOOK_PATH || "/line/webhook",
+    lineWebhookHost: env.LINE_WEBHOOK_HOST || "0.0.0.0",
+    lineWebhookPort: parseInteger("LINE_WEBHOOK_PORT", env.LINE_WEBHOOK_PORT, 8787),
+    lineAllowedUserIds: parseOptionalCsv(env.LINE_ALLOWED_USER_IDS),
+    lineAskQuestionEnabled: parseBoolean(env.LINE_ASKQUESTION_ENABLED, true),
+    lineAskQuestionCooldownMs: parseInteger("LINE_ASKQUESTION_COOLDOWN_MS", env.LINE_ASKQUESTION_COOLDOWN_MS, 300000),
     rawMaxFileMb: parseNumber("RAW_MAX_FILE_MB", env.RAW_MAX_FILE_MB, 200),
     rawKeepDays: parseInteger("RAW_KEEP_DAYS", env.RAW_KEEP_DAYS, 3),
     compressedKeepDays: parseInteger("COMPRESSED_KEEP_DAYS", env.COMPRESSED_KEEP_DAYS, 30),

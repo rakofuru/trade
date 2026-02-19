@@ -58,6 +58,40 @@ npm.cmd run doctor -- --hours 1
   - 停止経路（budget/risk/stability/signal）
   - 監視経路（doctor/report/metrics）
 
+## 3-1. LINE AskQuestion / Human-in-the-loop
+
+- 目的:
+  - AskQuestion（判断が必要な場面）だけを LINE へ通知
+  - LINE 返信テンプレを bot が機械解釈して安全コマンドを実行
+- 同一Nodeプロセス内でWebhookサーバを起動（追加常駐プロセスなし）
+- 必須ENV:
+  - `LINE_CHANNEL_ID`
+  - `LINE_CHANNEL_SECRET`
+  - `LINE_CHANNEL_ACCESS_TOKEN`（未設定だと送信/返信はできません）
+  - `PUBLIC_BASE_URL`
+  - `LINE_WEBHOOK_PATH`（例: `/line/webhook`）
+  - `LINE_ALLOWED_USER_IDS`（`Uxxxx,Uyyyy`）
+
+LINE側の作業:
+1. LINE Developers で Messaging API channel を作成
+2. Channel access token を発行し `LINE_CHANNEL_ACCESS_TOKEN` に設定
+3. Webhook URL を `PUBLIC_BASE_URL + LINE_WEBHOOK_PATH` に設定
+4. Webhook を有効化
+5. 応答設定で Messaging API を有効にし、必要に応じて自動応答を無効化
+6. 運用者アカウントを友だち追加し、`userId` を `LINE_ALLOWED_USER_IDS` に登録
+
+受け付ける返信テンプレ:
+```text
+BOT_DECISION_V1
+action=APPROVE|REJECT|PAUSE|RESUME|FLATTEN|CANCEL_ORDERS|CUSTOM
+coin=BTC|ETH|ALL
+size=
+reason=
+ttl_sec=
+```
+- 自由文は無視され、テンプレkey=valueのみ解釈されます
+- 署名検証（`X-Line-Signature`）とallowlistで拒否判定します
+
 ## 4. Data Layout
 
 - `data/streams/YYYY-MM-DD/<stream>.jsonl`
@@ -235,6 +269,16 @@ cleanup最終失敗時: `RUNTIME_KILL_SWITCH_FILE` を作成して再起動後�
   - `DAILY_LOSS_MODE`
   - `SHUTDOWN_CLEANUP_MAX_RETRIES`
   - `SHUTDOWN_CLEANUP_BACKOFF_BASE_MS`
+  - `LINE_CHANNEL_ID`
+  - `LINE_CHANNEL_SECRET`
+  - `LINE_CHANNEL_ACCESS_TOKEN`
+  - `PUBLIC_BASE_URL`
+  - `LINE_WEBHOOK_PATH`
+  - `LINE_WEBHOOK_HOST`
+  - `LINE_WEBHOOK_PORT`
+  - `LINE_ALLOWED_USER_IDS`
+  - `LINE_ASKQUESTION_ENABLED`
+  - `LINE_ASKQUESTION_COOLDOWN_MS`
 - TP/SL:
   - `TPSL_ENABLED`
   - `TP_BPS`
