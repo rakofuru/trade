@@ -26,6 +26,7 @@ npm.cmd run replay
 npm.cmd run report
 npm.cmd run verify -- --hours 1
 npm.cmd run ops:performance -- --hours 24 --format table
+npm.cmd run ops:strategy-decisions -- --hours 24 --format table
 npm.cmd run ops:daily-summary -- --day-offset 1 --summary-only
 npm.cmd run ops:position-why -- --format table
 npm.cmd run ops:position-why -- --format json
@@ -41,6 +42,7 @@ npm.cmd run doctor -- --hours 1
 - `report`: 人間向け戦績レポート（表形式）
 - `verify`: raw_http の exchange:order エラー検査（時間窓ベース）
 - `ops:performance`: Invariant込みの戦績表示（`table` / `md` / `json`）
+- `ops:strategy-decisions`: `strategy_decision` 集計（entry/skip/exit、reason、coin/regime、minEdge/churn比率）
 - `ops:daily-summary`: 日次サマリー(JSON + Markdown)の生成
 - `ops:position-why`: 現在ポジションの「なぜ入ったか」を表示（`table` / `md` / `json`）
 - `ops-report`: 日本語寄りの人間向けサマリー（Invariant/ガード/直近チェーン）
@@ -91,32 +93,66 @@ npm.cmd run doctor -- --hours 1
   - `TREND_UP / TREND_DOWN / RANGE / TURBULENCE / NO_TRADE`
   - 入力: 1m生データ + 内部集計5m/15m（EMA20/50, ADX14, ATR14%, VWAP60, Zscore60）
 - Trend戦略:
-  - Pullback継続（EMA20(1m) 押し戻り後の再クロス）
+  - ブレイクアウト順張り（1m高値/安値の更新を確認してエントリー）
+  - ダマシ回避: confirm bars / breakout buffer / 実体比率 / 急変率フィルタ
+  - fee-aware minimum edge: `minEdgeBps = fee(taker/maker想定) + slippage(L2推定) + base + safety + volAdj(ATR%)`
+  - `breakoutBps < minEdgeBps` の場合は `NO_TRADE_BREAKOUT_MIN_EDGE` で見送り
   - maker優先 (`tif=Alo`) / TTL 8s
   - 例外taker (`tif=Ioc`) は TTL失効後の価格乖離条件 + spread/slippage + 日次taker上限を満たす場合のみ
 - Range戦略:
   - `RANGE` 時のみ、VWAP回帰逆張り（Zscore60）
+  - 高ボラ/急変は不参加（ATR%・1m変化率でブロック）
   - maker限定 (`tif=Alo`) / TTL 10s / taker禁止
 - 追加ガード:
+  - `NO_TRADE_ENTRY_HOURLY_LIMIT`（1コインあたり時間内エントリー回数上限）
+  - `NO_TRADE_ENTRY_COOLDOWN`（連続エントリーのクールダウン）
+  - `NO_TRADE_RESTART_WARMUP`（再起動直後の安全ウォームアップ）
+  - レジーム切替ヒステリシス（min hold + confirm bars + flip churn cooldown）
   - `DAILY_TRADE_LIMIT`（日次fill上限）
   - `TAKER_LIMIT`（日次taker fill上限）
   - `TAKER_STREAK_LIMIT`（連続takerで当日maker-only化）
   - `PYRAMIDING_BLOCKED`（同方向追加建て禁止）
   - 反対シグナルは `FLIP_WAIT_FLAT`（先にreduceOnlyでフラット化）
+  - すべての entry/skip は `reasonCode` と主要特徴量（例: `ret1mPct`, `atrPct`, `breakoutBps`, `minEdgeBps`）をメトリクスへ記録
+
+### Strategy Decision Metrics
+
+- stream: `metrics`
+- `type="strategy_decision"` の主キー:
+  - `action` (`entry` / `skip` / `exit`)
+  - `reasonCode`（統一skip/entry理由）
+  - `coin`, `regime`, `ts`
+  - `ret1mPct`, `atrPct`, `breakoutBps`, `minEdgeBps`（存在する場合）
+  - `strategyContextId`（entry時に `cloid` と紐づく）
+- 集計例:
+  - skip理由Top: `jq 'select(.type=="strategy_decision" and .action=="skip") | .reasonCode'`
+  - coin/regime別: `jq 'select(.type=="strategy_decision") | {coin, regime, action, reasonCode}'`
+
+### Strategy Decision Report CLI
+
+- `npm.cmd run ops:strategy-decisions -- --hours 24 --format table`
+- `npm.cmd run ops:strategy-decisions -- --hours 24 --coin BTC --format json`
+- `--since/--until` で任意期間を指定可能（例: `--since 2026-02-19T00:00:00Z --until now`）
 
 ## 7. Hard Risk Limits
 
 以下は利益最大化のための生存条件として強制:
 
 - `RISK_MAX_DAILY_LOSS_USD`
+- `DAILY_LOSS_MODE=utc_day|rolling24h`（既定: `utc_day`）
 - `RISK_MAX_DRAWDOWN_BPS`
 - `RISK_MAX_POSITION_NOTIONAL_USD`
 - `RISK_MAX_ORDER_NOTIONAL_USD`
-- `RISK_MAX_OPEN_ORDERS`
+- `RISK_MAX_OPEN_ORDERS`（取引所open orders件数を優先して判定）
+- `OPEN_ORDERS_RECONCILE_INTERVAL_MS`, `OPEN_ORDERS_RECONCILE_MAX_FAILURES`
+- `WS_WATCHDOG_INTERVAL_MS`, `WS_MESSAGE_TIMEOUT_MS`
 - `MAX_CONCURRENT_POSITIONS`
 - `TPSL_ENABLED`, `TP_BPS`, `SL_BPS`（取引所側 trigger TP/SL）
+- `RUNTIME_KILL_SWITCH_FILE`（ファイル存在時に安全停止）
+- `SHUTDOWN_CLEANUP_MAX_RETRIES`, `SHUTDOWN_CLEANUP_BACKOFF_BASE_MS`
 
 違反時: 自動停止 -> 未約定キャンセル -> ポジションフラット化（`FLATTEN_POSITIONS_ON_STOP=true`）
+cleanup最終失敗時: `RUNTIME_KILL_SWITCH_FILE` を作成して再起動後の自動売買再開を抑止。
 
 ## 8. Budget Controls
 
@@ -189,7 +225,16 @@ npm.cmd run doctor -- --hours 1
   - `STABILITY_MAX_CANCEL_ERROR_RATE`
   - `STABILITY_MAX_WS_RECONNECT_RATIO`
   - `STABILITY_MAX_DRAWDOWN_BPS`
-  - `STABILITY_FAIL_ACTION=warn|shutdown`
+  - `STABILITY_FAIL_ACTION=warn|shutdown`（既定: `shutdown`）
+- Runtime safety:
+  - `RUNTIME_KILL_SWITCH_FILE`
+  - `WS_WATCHDOG_INTERVAL_MS`
+  - `WS_MESSAGE_TIMEOUT_MS`
+  - `OPEN_ORDERS_RECONCILE_INTERVAL_MS`
+  - `OPEN_ORDERS_RECONCILE_MAX_FAILURES`
+  - `DAILY_LOSS_MODE`
+  - `SHUTDOWN_CLEANUP_MAX_RETRIES`
+  - `SHUTDOWN_CLEANUP_BACKOFF_BASE_MS`
 - TP/SL:
   - `TPSL_ENABLED`
   - `TP_BPS`
@@ -202,6 +247,29 @@ npm.cmd run doctor -- --hours 1
   - `STRATEGY_CONSECUTIVE_TAKER_LIMIT`
   - `STRATEGY_DATA_STALE_*`
   - `STRATEGY_TREND_*`, `STRATEGY_RANGE_*`
+  - `STRATEGY_MIN_EDGE_BASE_BPS`
+  - `STRATEGY_MIN_EDGE_VOL_K`
+  - `STRATEGY_MIN_EDGE_SAFETY_BUFFER_BPS`
+  - `STRATEGY_MIN_EDGE_FALLBACK_SLIPPAGE_BPS`
+  - `STRATEGY_MIN_EDGE_MAKER_SLIP_FACTOR`
+  - `STRATEGY_FEE_MAKER_BPS`
+  - `STRATEGY_FEE_TAKER_BPS`
+  - `STRATEGY_FEE_REFRESH_MS`
+  - `STRATEGY_REGIME_MIN_HOLD_MS`
+  - `STRATEGY_REGIME_CONFIRM_BARS`
+  - `STRATEGY_REGIME_FLIP_WINDOW_MS`
+  - `STRATEGY_REGIME_FLIP_MAX_IN_WINDOW`
+  - `STRATEGY_REGIME_FLIP_COOLDOWN_MS`
+  - `STRATEGY_RESTART_NO_TRADE_MS`
+  - `STRATEGY_TREND_BREAKOUT_LOOKBACK_BARS`
+  - `STRATEGY_TREND_BREAKOUT_CONFIRM_BARS`
+  - `STRATEGY_TREND_BREAKOUT_BUFFER_BPS`
+  - `STRATEGY_TREND_BREAKOUT_MIN_BODY_RATIO`
+  - `STRATEGY_TREND_BREAKOUT_MAX_RET_1M_PCT`
+  - `STRATEGY_RANGE_MAX_ATR_PCT`
+  - `STRATEGY_RANGE_MAX_RET_1M_PCT`
+  - `STRATEGY_MAX_ENTRIES_PER_COIN_PER_HOUR`
+  - `STRATEGY_ENTRY_COOLDOWN_MS`
   - `BTC_*`, `ETH_*`（spread/slippage/turbulence/taker trigger）
  - Vault:
   - `HYPERLIQUID_VAULT_MODE_ENABLED=false`（通常運用で推奨）

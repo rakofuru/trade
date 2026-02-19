@@ -6,6 +6,25 @@ import { HyperliquidHttpClient } from "./hyperliquid/client.mjs";
 import { TradingEngine } from "./core/trading-engine.mjs";
 import { GptAdvisor } from "./core/gpt-advisor.mjs";
 
+function toError(input) {
+  if (input instanceof Error) {
+    return input;
+  }
+  if (typeof input === "string") {
+    return new Error(input);
+  }
+  try {
+    return new Error(JSON.stringify(input));
+  } catch {
+    return new Error(String(input));
+  }
+}
+
+function reasonTag(kind, error) {
+  const base = `${kind}:${String(error?.message || "unknown")}`;
+  return base.slice(0, 240);
+}
+
 async function main() {
   let config;
   try {
@@ -41,6 +60,27 @@ async function main() {
     await engine.requestShutdown(reason);
   };
 
+  let fatalInProgress = false;
+  const handleFatal = (kind, rawError) => {
+    const error = toError(rawError);
+    if (fatalInProgress) {
+      logger.error("Fatal handler already running", { kind, error: error.message });
+      process.exitCode = 1;
+      return;
+    }
+    fatalInProgress = true;
+    logger.error("Fatal process event", { kind, error: error.message, stack: error.stack });
+    engine.requestShutdown(
+      reasonTag(kind, error),
+      error,
+      { createKillSwitch: true },
+    ).catch((shutdownError) => {
+      logger.error("Fatal shutdown failed", { kind, error: shutdownError.message });
+    }).finally(() => {
+      process.exitCode = 1;
+    });
+  };
+
   process.on("SIGINT", () => {
     shutdown("SIGINT").catch((err) => {
       logger.error("Shutdown failed", { error: err.message });
@@ -51,6 +91,14 @@ async function main() {
     shutdown("SIGTERM").catch((err) => {
       logger.error("Shutdown failed", { error: err.message });
     });
+  });
+
+  process.on("uncaughtException", (error) => {
+    handleFatal("uncaughtException", error);
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    handleFatal("unhandledRejection", reason);
   });
 
   try {
@@ -76,7 +124,7 @@ async function main() {
 
     logger.error("Fatal startup error", { error: error.message, stack: error.stack });
     try {
-      await engine.requestShutdown("fatal_error", error);
+      await engine.requestShutdown("fatal_error", error, { createKillSwitch: true });
     } catch {
       // no-op
     }

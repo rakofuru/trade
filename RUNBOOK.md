@@ -130,6 +130,29 @@ sudo /bin/journalctl -u hlauto -n 200 --no-pager
 sudo /bin/journalctl -u hlauto --since "10 min ago" --no-pager
 ```
 
+Emergency stop (kill switch file):
+```bash
+touch /opt/hlauto/trade/data/state/KILL_SWITCH
+```
+- Bot detects `RUNTIME_KILL_SWITCH_FILE` and performs graceful shutdown.
+- `run-bot.sh` waits while the file exists, so auto-restart does not resume trading.
+- 致命例外/cleanup最終失敗時も同ファイルが自動作成され、二次被害防止のため再起動売買を停止維持する。
+
+Resume:
+```bash
+rm -f /opt/hlauto/trade/data/state/KILL_SWITCH
+sudo /bin/systemctl restart hlauto
+```
+
+Runtime guardrails (always-on):
+- Single instance lock: `run-bot.sh` uses `flock` (`data/state/hlauto.lock`) to block duplicate bot processes.
+- WS watchdog: if no WS message for `WS_MESSAGE_TIMEOUT_MS`, bot forces reconnect (`WS_WATCHDOG_INTERVAL_MS` poll).
+- Open order reconcile: every `OPEN_ORDERS_RECONCILE_INTERVAL_MS`, exchange open-orders are reconciled to local state.
+- Reconcile hard-fail: consecutive reconcile errors reaching `OPEN_ORDERS_RECONCILE_MAX_FAILURES` trigger shutdown.
+- Daily loss window: `DAILY_LOSS_MODE=utc_day|rolling24h` (default `utc_day`) controls realized PnL day-start.
+- Shutdown cleanup retry: cancel/flatten retries (`SHUTDOWN_CLEANUP_MAX_RETRIES`, `SHUTDOWN_CLEANUP_BACKOFF_BASE_MS`).
+- Stability fail action default is `STABILITY_FAIL_ACTION=shutdown` (fail-open禁止).
+
 ## 7. Invariant report (on-demand)
 ```bash
 cd /opt/hlauto/trade

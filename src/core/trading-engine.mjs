@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { HyperliquidWsClient } from "../hyperliquid/ws-client.mjs";
 import {
   makeOrderAction,
@@ -28,6 +30,7 @@ import { ImprovementLoop } from "./improvement-loop.mjs";
 import { RollupManager } from "./rollup-manager.mjs";
 import { DataLifecycleManager } from "./data-lifecycle.mjs";
 import { CoinSelector } from "./coin-selector.mjs";
+import { ensureDir, fileExists } from "../utils/fs.mjs";
 
 const TPSL_CLOID_PREFIX_HEX = "7470736c"; // "tpsl"
 
@@ -62,12 +65,164 @@ function utcDayKey(ts = Date.now()) {
   return new Date(Number(ts)).toISOString().slice(0, 10);
 }
 
-function utcDayEndTs(ts = Date.now()) {
+function utcDayStartTs(ts = Date.now()) {
   const d = new Date(Number(ts));
   const y = d.getUTCFullYear();
   const m = d.getUTCMonth();
   const day = d.getUTCDate();
-  return Date.UTC(y, m, day + 1, 0, 0, 0, 0);
+  return Date.UTC(y, m, day, 0, 0, 0, 0);
+}
+
+function utcDayEndTs(ts = Date.now()) {
+  const start = utcDayStartTs(ts);
+  return start + (24 * 3600 * 1000);
+}
+
+export function dailyLossWindowStartTs(ts = Date.now(), mode = "utc_day") {
+  const now = Number(ts || Date.now());
+  const normalizedMode = String(mode || "utc_day").toLowerCase();
+  if (normalizedMode === "rolling24h") {
+    return now - (24 * 3600 * 1000);
+  }
+  return utcDayStartTs(now);
+}
+
+function sanitizeReasonCode(raw) {
+  const normalized = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^no_trade_/, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized || "unknown";
+}
+
+function optionalNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function buildStrategyContextId({ coin, armId, nowTs = Date.now() }) {
+  const coinPart = String(coin || "na").toLowerCase();
+  const armPart = String(armId || "na").toLowerCase();
+  const timePart = Number(nowTs || Date.now()).toString(36);
+  const rand = crypto.randomBytes(4).toString("hex");
+  return `sctx_${coinPart}_${armPart}_${timePart}_${rand}`;
+}
+
+function withStrategyContextId(signal, { coin, armId, nowTs = Date.now() } = {}) {
+  if (!signal || typeof signal !== "object") {
+    return signal;
+  }
+  const existing = String(
+    signal.strategyContextId
+    || signal?.explanation?.feature?.strategyContextId
+    || "",
+  ).trim();
+  if (existing) {
+    return {
+      ...signal,
+      strategyContextId: existing,
+      explanation: signal.explanation ? {
+        ...signal.explanation,
+        feature: {
+          ...(signal.explanation.feature || {}),
+          strategyContextId: existing,
+        },
+      } : {
+        style: "strategy_signal",
+        feature: {
+          strategyContextId: existing,
+        },
+      },
+    };
+  }
+
+  const generated = buildStrategyContextId({ coin, armId, nowTs });
+  return {
+    ...signal,
+    strategyContextId: generated,
+    explanation: signal.explanation ? {
+      ...signal.explanation,
+      feature: {
+        ...(signal.explanation.feature || {}),
+        strategyContextId: generated,
+      },
+    } : {
+      style: "strategy_signal",
+      feature: {
+        strategyContextId: generated,
+      },
+    },
+  };
+}
+
+export function buildStrategyDecisionMetric({
+  action,
+  signal = null,
+  coin = null,
+  regime = null,
+  reason = null,
+  reasonCode = null,
+  ts = Date.now(),
+  config = {},
+  cloid = null,
+  armId = null,
+  strategy = null,
+  strategyContextId = null,
+} = {}) {
+  const feature = signal?.explanation?.feature || {};
+  const normalizedAction = ["entry", "skip", "exit"].includes(String(action || "").toLowerCase())
+    ? String(action || "").toLowerCase()
+    : "skip";
+  const resolvedReason = String(reason || signal?.reason || "");
+  const explicitReasonCode = String(reasonCode || feature?.reasonCode || "").trim();
+  const resolvedReasonCode = explicitReasonCode
+    || sanitizeReasonCode(
+      resolvedReason
+      || signal?.explanation?.style
+      || signal?.strategy
+      || "unknown",
+    );
+  const flipsInWindow = optionalNumber(feature?.flipsInWindow);
+  const flipMax = Math.max(1, Number(config?.strategyRegimeFlipMaxInWindow || 4));
+  const churnScore = optionalNumber(feature?.churnScore)
+    ?? (Number.isFinite(flipsInWindow) ? Number((flipsInWindow / flipMax).toFixed(6)) : null);
+
+  return {
+    type: "strategy_decision",
+    ts: Number(ts || Date.now()),
+    action: normalizedAction,
+    reasonCode: resolvedReasonCode,
+    reason: resolvedReason || null,
+    coin: String(coin || signal?.coin || ""),
+    regime: String(regime || signal?.regime || "unknown"),
+    armId: armId || null,
+    strategy: strategy || signal?.strategy || null,
+    cloid: cloid || null,
+    strategyContextId: String(
+      strategyContextId
+      || signal?.strategyContextId
+      || feature?.strategyContextId
+      || "",
+    ).trim() || null,
+    ret1mPct: optionalNumber(feature?.ret1mPct),
+    atrPct: optionalNumber(feature?.atrPct),
+    breakoutBps: optionalNumber(feature?.breakoutBps),
+    minEdgeBps: optionalNumber(feature?.minEdgeBps),
+    cooldownRemainingMs: optionalNumber(
+      feature?.cooldownRemainingMs
+      ?? feature?.waitMs
+      ?? feature?.cooldownWaitMs,
+    ),
+    regimeHoldRemainingMs: optionalNumber(
+      feature?.regimeHoldRemainingMs
+      ?? feature?.holdRemainingMs,
+    ),
+    churnScore,
+    flipsInWindow,
+    expectedNotionalUsd: optionalNumber(feature?.expectedNotionalUsd),
+  };
 }
 
 function sameDirection(positionSize, side) {
@@ -125,6 +280,12 @@ export class TradingEngine {
     const runtime = storage.loadState("runtime-state", {});
     this.lastFillCursor = runtime.lastFillCursor || Date.now() - config.backfillHours * 3600 * 1000;
     this.openOrders = new Map((runtime.openOrders || []).map((x) => [x.cloid, x]));
+    const savedExchangeOpenOrdersCount = Number(runtime.exchangeOpenOrdersCount);
+    this.exchangeOpenOrdersCount = Number.isFinite(savedExchangeOpenOrdersCount)
+      ? Math.max(0, savedExchangeOpenOrdersCount)
+      : null;
+    this.openOrdersReconcileFailureStreak = Math.max(0, Number(runtime.openOrdersReconcileFailureStreak || 0));
+    this.lastOpenOrdersReconcileAt = Math.max(0, Number(runtime.lastOpenOrdersReconcileAt || 0));
     this.orderContextsByCloid = new Map((runtime.orderContextsByCloid || []).map((x) => [x.cloid, x]));
     this.orderContextsByOid = new Map((runtime.orderContextsByOid || []).map((x) => [String(x.oid), x]));
     this.tpslByCoin = new Map((runtime.tpslByCoin || []).map((x) => [x.coin, x]));
@@ -185,6 +346,7 @@ export class TradingEngine {
     await this.#bootstrapManagedTpSlState();
     await this.#primeUserState();
     await this.#runBackfill();
+    await this.#reconcileOpenOrders({ reason: "init" });
     await this.#refreshRiskSnapshot(true);
     this.#assertRiskWithinLimits();
     await this.#reconcileProtectionState();
@@ -216,18 +378,23 @@ export class TradingEngine {
     return this.stopPromise;
   }
 
-  async requestShutdown(reason, error = null) {
+  async requestShutdown(reason, error = null, options = {}) {
     if (this.stopping) {
       return;
     }
     this.stopping = true;
     this.running = false;
     this.stopReason = reason;
+    const forceKillSwitch = Boolean(options?.createKillSwitch);
 
     this.logger.warn("Shutdown requested", {
       reason,
       error: error ? error.message : undefined,
     });
+
+    if (forceKillSwitch) {
+      this.#activateRuntimeKillSwitch(reason, error);
+    }
 
     for (const timer of this.timers) {
       clearInterval(timer);
@@ -255,22 +422,46 @@ export class TradingEngine {
       }
     }
 
+    const cleanupFailures = [];
     if (this.config.cancelOpenOrdersOnStop) {
-      try {
-        await this.cancelAllOpenOrders();
-      } catch (cancelError) {
-        this.logger.error("Failed to cancel open orders", { error: cancelError.message });
+      const cancelResult = await this.#runShutdownStepWithRetry({
+        label: "cancel_open_orders",
+        fn: async () => {
+          await this.cancelAllOpenOrders({ strict: true });
+        },
+      });
+      if (!cancelResult.ok) {
+        cleanupFailures.push(cancelResult);
       }
     }
 
     if (this.config.flattenPositionsOnStop) {
-      try {
-        await this.#flattenAllPositions();
-      } catch (flattenError) {
-        this.logger.error("Failed to flatten positions on shutdown", {
-          error: flattenError.message,
-        });
+      const flattenResult = await this.#runShutdownStepWithRetry({
+        label: "flatten_positions",
+        fn: async () => {
+          await this.#flattenAllPositions();
+        },
+      });
+      if (!flattenResult.ok) {
+        cleanupFailures.push(flattenResult);
       }
+    }
+
+    if (cleanupFailures.length) {
+      const failures = cleanupFailures.map((x) => ({
+        step: x.label,
+        attempts: x.attempts,
+        error: x.error?.message || "unknown",
+      }));
+      this.storage.appendMetric({
+        type: "shutdown_cleanup_failed",
+        reason,
+        failures,
+      });
+      this.#activateRuntimeKillSwitch(
+        "shutdown_cleanup_failed",
+        new Error(failures.map((x) => `${x.step}:${x.error}`).join("; ")),
+      );
     }
 
     this.rollups.flush(Date.now() + this.config.rollupIntervalSec * 1000);
@@ -300,6 +491,105 @@ export class TradingEngine {
 
     if (this.resolveStop) {
       this.resolveStop({ reason, report: report.summary, openPositions: positions });
+    }
+  }
+
+  async #runShutdownStepWithRetry({ label, fn }) {
+    const maxAttempts = Math.max(1, Number(this.config.shutdownCleanupMaxRetries || 3));
+    const baseDelayMs = Math.max(100, Number(this.config.shutdownCleanupBackoffBaseMs || 500));
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await fn();
+        if (attempt > 1) {
+          this.logger.warn("Shutdown step succeeded after retry", { label, attempt, maxAttempts });
+        }
+        this.storage.appendMetric({
+          type: "shutdown_cleanup_step",
+          label,
+          ok: true,
+          attempt,
+          maxAttempts,
+        });
+        return { ok: true, label, attempts: attempt, error: null };
+      } catch (error) {
+        const finalAttempt = attempt >= maxAttempts;
+        this.storage.appendError({
+          where: `shutdown_${label}`,
+          error: error.message,
+          attempt,
+          maxAttempts,
+        });
+        this.storage.appendMetric({
+          type: "shutdown_cleanup_step",
+          label,
+          ok: false,
+          attempt,
+          maxAttempts,
+          error: error.message,
+        });
+        if (finalAttempt) {
+          this.logger.error("Shutdown step failed", {
+            label,
+            attempt,
+            maxAttempts,
+            error: error.message,
+          });
+          return { ok: false, label, attempts: attempt, error };
+        }
+        const delayMs = baseDelayMs * (2 ** (attempt - 1));
+        this.logger.warn("Shutdown step failed; retrying", {
+          label,
+          attempt,
+          maxAttempts,
+          delayMs,
+          error: error.message,
+        });
+        await sleep(delayMs);
+      }
+    }
+    return {
+      ok: false,
+      label,
+      attempts: maxAttempts,
+      error: new Error("shutdown_cleanup_unreachable"),
+    };
+  }
+
+  #activateRuntimeKillSwitch(reason, error = null) {
+    const killSwitchFile = String(this.config.runtimeKillSwitchFile || "").trim();
+    if (!killSwitchFile) {
+      return false;
+    }
+    try {
+      ensureDir(path.dirname(killSwitchFile));
+      const payload = {
+        ts: Date.now(),
+        isoTime: new Date().toISOString(),
+        reason: String(reason || "unknown"),
+        error: error ? String(error.message || error) : null,
+      };
+      fs.writeFileSync(killSwitchFile, `${JSON.stringify(payload)}\n`, "utf8");
+      this.storage.appendMetric({
+        type: "runtime_kill_switch_created",
+        file: killSwitchFile,
+        reason: payload.reason,
+      });
+      this.logger.error("Runtime kill switch created", {
+        file: killSwitchFile,
+        reason: payload.reason,
+      });
+      return true;
+    } catch (writeError) {
+      this.storage.appendError({
+        where: "runtime_kill_switch_create",
+        file: killSwitchFile,
+        error: writeError.message,
+      });
+      this.logger.error("Failed to create runtime kill switch", {
+        file: killSwitchFile,
+        error: writeError.message,
+      });
+      return false;
     }
   }
 
@@ -569,6 +859,12 @@ export class TradingEngine {
         await this.#refreshSelectedCoins();
       });
     }, this.config.coinSelectionRefreshMs));
+
+    this.timers.push(setInterval(() => {
+      this.#guarded(async () => {
+        await this.#reconcileOpenOrders({ reason: "periodic" });
+      });
+    }, Math.max(5000, Number(this.config.openOrdersReconcileIntervalMs || 45000))));
   }
 
   async #guarded(task) {
@@ -577,6 +873,7 @@ export class TradingEngine {
     }
 
     try {
+      this.#assertRuntimeKillSwitchNotTriggered();
       await task();
     } catch (error) {
       this.storage.appendError({
@@ -825,9 +1122,15 @@ export class TradingEngine {
       }
 
       if (!isReduceOnly) {
+        const strategyContextId = String(
+          record?.strategyContextId
+          || record?.explanation?.feature?.strategyContextId
+          || "",
+        ).trim() || null;
         const entrySnapshot = {
           coin,
           cloid: record?.cloid || null,
+          strategyContextId,
           side: record?.side || null,
           entryTs: Number(record?.fillTime || record?.ts || Date.now()),
           entryIso: new Date(Number(record?.fillTime || record?.ts || Date.now())).toISOString(),
@@ -836,7 +1139,13 @@ export class TradingEngine {
           regime: record?.regime || null,
           strategy: record?.strategy || null,
           reason: String(record?.reason || record?.strategy || "unknown"),
-          reasonCode: String(record?.explanation?.style || record?.reason || record?.strategy || "unknown"),
+          reasonCode: String(
+            record?.explanation?.feature?.reasonCode
+            || record?.explanation?.style
+            || record?.reason
+            || record?.strategy
+            || "unknown",
+          ),
           features: record?.explanation?.feature || null,
           protectionPlan: plan ? {
             slPct: Number(plan?.slPct || 0) || null,
@@ -861,6 +1170,11 @@ export class TradingEngine {
         type: "fill_execution_summary",
         coin,
         cloid: record?.cloid || null,
+        strategyContextId: String(
+          record?.strategyContextId
+          || record?.explanation?.feature?.strategyContextId
+          || "",
+        ).trim() || null,
         side: record?.side,
         fillPx,
         notional,
@@ -1140,7 +1454,7 @@ export class TradingEngine {
       const mid = Number(this.marketData.mid(coin) || this.marketData.lastBook(coin)?.mid || 0);
       const expectedNotionalUsd = mid > 0 ? (mid * Number(this.config.orderSize || 0)) : 0;
 
-      const signal = buildSignal({
+      const rawSignal = buildSignal({
         arm,
         coin,
         regime,
@@ -1151,6 +1465,11 @@ export class TradingEngine {
         paramOverride: override,
         config: this.config,
         expectedNotionalUsd,
+      });
+      const signal = withStrategyContextId(rawSignal, {
+        coin,
+        armId: arm.id,
+        nowTs: Date.now(),
       });
 
       if (!signal) {
@@ -1175,6 +1494,16 @@ export class TradingEngine {
             detail: signal.explanation?.feature || null,
           });
         }
+        this.storage.appendMetric(buildStrategyDecisionMetric({
+          action: "skip",
+          signal,
+          coin,
+          regime: signal.regime || regime,
+          ts: Date.now(),
+          config: this.config,
+          armId: arm.id,
+          strategy: arm.strategy,
+        }));
         continue;
       }
 
@@ -1259,7 +1588,12 @@ export class TradingEngine {
   }
 
   async #executeSignal(decision) {
-    const { signal, coin, arm, regime } = decision;
+    const { coin, arm, regime } = decision;
+    const signal = withStrategyContextId(decision.signal, {
+      coin,
+      armId: arm?.id || "unknown",
+      nowTs: Date.now(),
+    });
     const asset = this.assetsByCoin.get(signal.coin);
     if (asset === undefined) {
       throw new Error(`Unknown asset for coin ${signal.coin}`);
@@ -1279,6 +1613,18 @@ export class TradingEngine {
         reason: entryGuard.reason,
         detail: entryGuard.detail || null,
       });
+      this.storage.appendMetric(buildStrategyDecisionMetric({
+        action: "skip",
+        signal,
+        coin,
+        regime,
+        reason: entryGuard.reason,
+        reasonCode: entryGuard.reason,
+        ts: Date.now(),
+        config: this.config,
+        armId: arm.id,
+        strategy: arm.strategy,
+      }));
       return {
         submitted: false,
         nonError: true,
@@ -1292,6 +1638,18 @@ export class TradingEngine {
 
     if (!signal.reduceOnly && coinPosition) {
       if (sameDirection(coinPosition.size, signal.side)) {
+        this.storage.appendMetric(buildStrategyDecisionMetric({
+          action: "skip",
+          signal,
+          coin,
+          regime,
+          reason: "PYRAMIDING_BLOCKED",
+          reasonCode: "PYRAMIDING_BLOCKED",
+          ts: Date.now(),
+          config: this.config,
+          armId: arm.id,
+          strategy: arm.strategy,
+        }));
         return {
           submitted: false,
           nonError: true,
@@ -1318,6 +1676,18 @@ export class TradingEngine {
         submitted: Boolean(flattened),
         flattenRequestedAt: Number(pendingFlip.requestedAt || 0),
       });
+      this.storage.appendMetric(buildStrategyDecisionMetric({
+        action: "skip",
+        signal,
+        coin,
+        regime,
+        reason: "FLIP_WAIT_FLAT",
+        reasonCode: "FLIP_WAIT_FLAT",
+        ts: Date.now(),
+        config: this.config,
+        armId: arm.id,
+        strategy: arm.strategy,
+      }));
       return {
         submitted: false,
         nonError: true,
@@ -1467,6 +1837,12 @@ export class TradingEngine {
     }
 
     const { outcome, cloid, sentAt, signal: usedSignal, rawResponse } = finalResult;
+    const strategyContextId = String(
+      usedSignal?.strategyContextId
+      || usedSignal?.explanation?.feature?.strategyContextId
+      || signal?.strategyContextId
+      || "",
+    ).trim() || null;
     const context = {
       cloid,
       oid: outcome.oid,
@@ -1486,6 +1862,7 @@ export class TradingEngine {
       reason: usedSignal.explanation?.style || usedSignal.strategy || arm.strategy,
       protectionPlan: usedSignal.protectionPlan || null,
       signalMid: Number(this.marketData.mid(usedSignal.coin) || 0),
+      strategyContextId,
     };
 
     this.orderContextsByCloid.set(cloid, context);
@@ -1511,9 +1888,22 @@ export class TradingEngine {
       sizing: usedSignal.sizing,
       protectionPlan: usedSignal.protectionPlan || null,
       reason: context.reason,
+      strategyContextId,
     };
 
     this.storage.appendOrderEvent(record);
+    this.storage.appendMetric(buildStrategyDecisionMetric({
+      action: "entry",
+      signal: usedSignal,
+      coin: usedSignal.coin,
+      regime,
+      ts: sentAt,
+      config: this.config,
+      cloid,
+      armId: arm.id,
+      strategy: arm.strategy,
+      strategyContextId,
+    }));
     if (!Boolean(usedSignal.reduceOnly)) {
       const flipState = this.recentFlipCompletedByCoin.get(String(usedSignal.coin)) || null;
       this.storage.appendMetric({
@@ -1761,6 +2151,169 @@ export class TradingEngine {
     return null;
   }
 
+  async #reconcileOpenOrders({ reason = "periodic" } = {}) {
+    const startedAt = Date.now();
+    try {
+      const rows = await this.client.fetchOpenOrders();
+      const previous = this.openOrders;
+      const next = new Map();
+      let unmappedCount = 0;
+
+      for (const row of rows) {
+        const oid = safeNumber(row?.oid ?? row?.order?.oid, null);
+        const resolvedCloid = row?.cloid
+          || row?.clientOrderId
+          || row?.order?.cloid
+          || row?.order?.clientOrderId
+          || (oid !== null ? this.orderContextsByOid.get(String(oid))?.cloid : null);
+        if (!resolvedCloid) {
+          unmappedCount += 1;
+          continue;
+        }
+        const cloid = String(resolvedCloid);
+        const existing = previous.get(cloid) || {};
+        const contextByCloid = this.orderContextsByCloid.get(cloid) || {};
+        const contextByOid = oid !== null ? (this.orderContextsByOid.get(String(oid)) || {}) : {};
+        const coin = String(
+          row?.coin
+          || row?.order?.coin
+          || existing.coin
+          || contextByCloid.coin
+          || contextByOid.coin
+          || "",
+        );
+        const rawAsset = safeNumber(row?.asset ?? row?.order?.asset, null);
+        const inferredAsset = coin && this.assetsByCoin.has(coin)
+          ? Number(this.assetsByCoin.get(coin))
+          : null;
+        const fallbackAsset = safeNumber(existing?.asset ?? contextByCloid?.asset ?? contextByOid?.asset, null);
+        const asset = rawAsset ?? inferredAsset ?? fallbackAsset ?? null;
+        const sideText = String(row?.side || row?.order?.side || "").toLowerCase();
+        const side = sideText.includes("buy")
+          ? "buy"
+          : (sideText.includes("sell")
+            ? "sell"
+            : (existing.side || contextByCloid.side || contextByOid.side || null));
+        const createdAt = safeNumber(
+          row?.timestamp ?? row?.time ?? row?.createdAt ?? row?.order?.timestamp ?? row?.order?.time,
+          Number(existing.createdAt || contextByCloid.sentAt || startedAt),
+        );
+        const sideKey = existing.sideKey || (coin && side ? `${coin}:${side}` : `reconciled:${cloid}`);
+
+        next.set(cloid, {
+          cloid,
+          asset,
+          coin: coin || existing.coin || contextByCloid.coin || null,
+          side,
+          sideKey,
+          strategy: existing.strategy || contextByCloid.strategy || contextByOid.strategy || "exchange_reconciled",
+          regime: existing.regime || contextByCloid.regime || contextByOid.regime || "unknown",
+          createdAt,
+          oid: oid !== null ? oid : (safeNumber(existing.oid, null) ?? null),
+        });
+
+        if (oid !== null) {
+          this.orderContextsByOid.set(String(oid), {
+            ...(contextByOid || contextByCloid || existing || {}),
+            cloid,
+            oid,
+            coin: coin || contextByOid.coin || contextByCloid.coin || existing.coin || null,
+            asset,
+            side,
+          });
+        }
+      }
+
+      const removed = [];
+      for (const [cloid] of previous.entries()) {
+        if (next.has(cloid)) {
+          continue;
+        }
+        removed.push(cloid);
+        if (this.orderTtlTimers.has(cloid)) {
+          clearTimeout(this.orderTtlTimers.get(cloid));
+          this.orderTtlTimers.delete(cloid);
+        }
+      }
+
+      const added = [];
+      for (const [cloid] of next.entries()) {
+        if (!previous.has(cloid)) {
+          added.push(cloid);
+        }
+      }
+
+      this.openOrders = next;
+      this.exchangeOpenOrdersCount = Math.max(0, rows.length);
+      this.lastOpenOrdersReconcileAt = startedAt;
+      this.openOrdersReconcileFailureStreak = 0;
+
+      if (added.length || removed.length || unmappedCount > 0) {
+        this.storage.appendMetric({
+          type: "open_orders_reconciled",
+          reason,
+          exchangeOpenOrders: rows.length,
+          localBefore: previous.size,
+          localAfter: next.size,
+          addedCount: added.length,
+          removedCount: removed.length,
+          addedSample: added.slice(0, 20),
+          removedSample: removed.slice(0, 20),
+          unmappedExchangeOrders: unmappedCount,
+        });
+        this.logger.warn("Open orders reconciled with exchange drift", {
+          reason,
+          exchangeOpenOrders: rows.length,
+          localBefore: previous.size,
+          localAfter: next.size,
+          added: added.length,
+          removed: removed.length,
+          unmappedExchangeOrders: unmappedCount,
+        });
+      }
+
+      return {
+        exchangeOpenOrders: rows.length,
+        localOpenOrders: next.size,
+        added: added.length,
+        removed: removed.length,
+        unmappedExchangeOrders: unmappedCount,
+      };
+    } catch (error) {
+      this.openOrdersReconcileFailureStreak += 1;
+      this.storage.appendError({
+        where: "open_orders_reconcile",
+        reason,
+        streak: this.openOrdersReconcileFailureStreak,
+        error: error.message,
+      });
+      this.storage.appendMetric({
+        type: "open_orders_reconcile_failed",
+        reason,
+        streak: this.openOrdersReconcileFailureStreak,
+        threshold: Number(this.config.openOrdersReconcileMaxFailures || 3),
+        error: error.message,
+      });
+      if (this.openOrdersReconcileFailureStreak >= Number(this.config.openOrdersReconcileMaxFailures || 3)) {
+        throw new RiskLimitError(
+          `open_orders_reconcile_failures(${this.openOrdersReconcileFailureStreak})`,
+          {
+            streak: this.openOrdersReconcileFailureStreak,
+            threshold: Number(this.config.openOrdersReconcileMaxFailures || 3),
+            error: error.message,
+          },
+        );
+      }
+      this.logger.warn("Open orders reconciliation failed", {
+        reason,
+        streak: this.openOrdersReconcileFailureStreak,
+        threshold: Number(this.config.openOrdersReconcileMaxFailures || 3),
+        error: error.message,
+      });
+      return null;
+    }
+  }
+
   async #refreshRiskSnapshot(force = false) {
     const now = Date.now();
     if (!force && now - Number(this.riskSnapshot?.checkedAt || 0) < 30000) {
@@ -1769,7 +2322,7 @@ export class TradingEngine {
 
     this.lastUserState = await this.client.fetchUserState();
 
-    const dayStart = now - (24 * 3600 * 1000);
+    const dayStart = dailyLossWindowStartTs(now, this.config.dailyLossMode);
     const executionRows = this.storage.readStream("execution", { maxLines: 60000 })
       .filter((x) => Number(x?.ts || 0) >= dayStart);
     const dailyPnl = executionRows.reduce((acc, row) => acc + Number(row?.realizedPnl || 0), 0);
@@ -1793,7 +2346,11 @@ export class TradingEngine {
       }).filter((x) => x[0]),
     );
     const positionNotional = inventoryNotional(this.lastUserState || {});
-    const openOrders = this.openOrders.size;
+    const exchangeOpenOrders = Number(this.exchangeOpenOrdersCount);
+    const localOpenOrders = this.openOrders.size;
+    const openOrders = Number.isFinite(exchangeOpenOrders)
+      ? Math.max(0, exchangeOpenOrders)
+      : localOpenOrders;
     const openCoins = new Set(openPositions.map((p) => String(p.coin || "")));
     for (const coin of this.pendingFlipByCoin.keys()) {
       if (!openCoins.has(String(coin))) {
@@ -1842,9 +2399,13 @@ export class TradingEngine {
 
     this.riskSnapshot = {
       checkedAt: now,
+      dailyLossMode: String(this.config.dailyLossMode || "utc_day"),
+      dayStart,
       dailyPnl,
       drawdownBps,
       openOrders,
+      openOrdersLocal: localOpenOrders,
+      openOrdersSource: Number.isFinite(exchangeOpenOrders) ? "exchange" : "local",
       openPositions: openPositions.length,
       positionNotional,
     };
@@ -1990,6 +2551,14 @@ export class TradingEngine {
 
     if (this.config.tpslCleanupOnStop) {
       await this.#cleanupManagedTpSlOrders("flatten_post_cleanup");
+    }
+
+    await sleep(800);
+    const afterState = await this.client.fetchUserState();
+    this.lastUserState = afterState;
+    const remaining = summarizeOpenPositions(afterState);
+    if (remaining.length) {
+      throw new Error(`positions_remaining_after_flatten(${remaining.length})`);
     }
   }
 
@@ -3537,10 +4106,12 @@ export class TradingEngine {
     });
   }
 
-  async cancelAllOpenOrders() {
+  async cancelAllOpenOrders({ strict = false } = {}) {
     const local = Array.from(this.openOrders.values());
     if (local.length) {
-      const cancels = local.map((o) => ({ asset: o.asset, cloid: o.cloid }));
+      const cancels = local
+        .filter((o) => o?.cloid && o?.asset !== undefined && o?.asset !== null)
+        .map((o) => ({ asset: o.asset, cloid: o.cloid }));
       for (let i = 0; i < cancels.length; i += 10) {
         await this.#cancelByCloid(cancels.slice(i, i + 10), "shutdown_local");
       }
@@ -3551,7 +4122,10 @@ export class TradingEngine {
         }
       }
       this.openOrders.clear();
-      this.logger.info("Canceled locally tracked open orders", { count: local.length });
+      this.logger.info("Canceled locally tracked open orders", {
+        trackedCount: local.length,
+        cancelByCloidCount: cancels.length,
+      });
     }
 
     try {
@@ -3592,12 +4166,22 @@ export class TradingEngine {
         }
         this.logger.info("Canceled open orders fetched from API", { count: cancelsByOid.length });
       }
+
+      if (strict) {
+        const remaining = await this.client.fetchOpenOrders();
+        if (remaining.length) {
+          throw new Error(`open_orders_remaining_after_cancel(${remaining.length})`);
+        }
+      }
     } catch (error) {
       this.logger.warn("Failed to cancel API-reported open orders", { error: error.message });
       this.storage.appendError({
         where: "cancelAllOpenOrders",
         error: error.message,
       });
+      if (strict) {
+        throw error;
+      }
     }
   }
 
@@ -3728,6 +4312,9 @@ export class TradingEngine {
     const runtimeState = {
       lastFillCursor: this.lastFillCursor,
       openOrders: Array.from(this.openOrders.values()),
+      exchangeOpenOrdersCount: this.exchangeOpenOrdersCount,
+      openOrdersReconcileFailureStreak: this.openOrdersReconcileFailureStreak,
+      lastOpenOrdersReconcileAt: this.lastOpenOrdersReconcileAt,
       orderContextsByCloid: Array.from(this.orderContextsByCloid.values()).slice(-3000),
       orderContextsByOid: Array.from(this.orderContextsByOid.entries()).map(([oid, ctx]) => ({ oid, ...ctx })).slice(-3000),
       tpslByCoin: Array.from(this.tpslByCoin.values()),
@@ -3796,6 +4383,23 @@ export class TradingEngine {
       priority2_learning: "Use regime-level adaptive exploration (lower UCB exploration when reward variance spikes)",
       priority3_operations: "Use dedicated Agent Wallet for production and set HYPERLIQUID_REQUIRE_AGENT_WALLET=true",
       priority4_debugging: "Add exchange_error_code index stream derived from raw_http for fast reject root-cause search",
+    });
+  }
+
+  #assertRuntimeKillSwitchNotTriggered() {
+    const killSwitchFile = String(this.config.runtimeKillSwitchFile || "").trim();
+    if (!killSwitchFile) {
+      return;
+    }
+    if (!fileExists(killSwitchFile)) {
+      return;
+    }
+    this.storage.appendMetric({
+      type: "runtime_kill_switch_triggered",
+      file: killSwitchFile,
+    });
+    throw new RiskLimitError(`Runtime kill switch triggered (${killSwitchFile})`, {
+      file: killSwitchFile,
     });
   }
 

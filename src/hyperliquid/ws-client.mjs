@@ -11,6 +11,24 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isWsOpen(ws) {
+  if (!ws) {
+    return false;
+  }
+  const openState = typeof WebSocketCtor.OPEN === "number" ? WebSocketCtor.OPEN : 1;
+  return Number(ws.readyState) === openState;
+}
+
+export function shouldTriggerWsWatchdog({ nowTs, lastMessageAt, timeoutMs }) {
+  const now = Number(nowTs || Date.now());
+  const last = Number(lastMessageAt || 0);
+  const timeout = Math.max(1000, Number(timeoutMs || 0));
+  if (!(last > 0)) {
+    return false;
+  }
+  return (now - last) >= timeout;
+}
+
 export class HyperliquidWsClient {
   constructor({
     config,
@@ -34,6 +52,10 @@ export class HyperliquidWsClient {
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
     this.wsImplLogged = false;
+    this.watchdogTimer = null;
+    this.lastMessageAt = 0;
+    this.watchdogTimeoutCount = 0;
+    this.watchdogCloseInFlight = false;
 
     this.seenHashes = new Map();
     this.maxSeen = 5000;
@@ -41,6 +63,8 @@ export class HyperliquidWsClient {
 
   start() {
     this.running = true;
+    this.lastMessageAt = Date.now();
+    this.#startWatchdog();
     this.#connect();
   }
 
@@ -49,6 +73,10 @@ export class HyperliquidWsClient {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
     }
     if (this.ws) {
       try {
@@ -96,9 +124,11 @@ export class HyperliquidWsClient {
     this.logger.info("Connecting websocket", { url: this.config.wsUrl, attempts: this.reconnectAttempts });
     const ws = new WebSocketCtor(this.config.wsUrl);
     this.ws = ws;
+    this.watchdogCloseInFlight = false;
 
     this.#bindEvent(ws, "open", async () => {
       this.reconnectAttempts = 0;
+      this.lastMessageAt = Date.now();
       this.logger.info("Websocket connected");
       for (const sub of this.subscriptions) {
         ws.send(JSON.stringify({ method: "subscribe", subscription: sub }));
@@ -111,6 +141,7 @@ export class HyperliquidWsClient {
 
     this.#bindEvent(ws, "message", async (event) => {
       const raw = typeof event.data === "string" ? event.data : Buffer.from(event.data).toString("utf8");
+      this.lastMessageAt = Date.now();
       if (this.#isDuplicate(raw)) {
         return;
       }
@@ -135,6 +166,7 @@ export class HyperliquidWsClient {
     });
 
     this.#bindEvent(ws, "close", async (event) => {
+      this.watchdogCloseInFlight = false;
       this.logger.warn("Websocket closed", { code: event.code, reason: event.reason || "" });
       if (this.onLifecycle) {
         await this.onLifecycle({ type: "disconnected", code: event.code, reason: event.reason || "" });
@@ -158,6 +190,52 @@ export class HyperliquidWsClient {
         this.#connect();
       }, delayMs);
     });
+  }
+
+  #startWatchdog() {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    const intervalMs = Math.max(1000, Number(this.config.wsWatchdogIntervalMs || 5000));
+    const timeoutMs = Math.max(intervalMs, Number(this.config.wsMessageTimeoutMs || 60000));
+    this.watchdogTimer = setInterval(() => {
+      if (!this.running) {
+        return;
+      }
+      if (!isWsOpen(this.ws)) {
+        return;
+      }
+      if (this.watchdogCloseInFlight) {
+        return;
+      }
+      if (!shouldTriggerWsWatchdog({
+        nowTs: Date.now(),
+        lastMessageAt: this.lastMessageAt,
+        timeoutMs,
+      })) {
+        return;
+      }
+      const idleMs = Date.now() - Number(this.lastMessageAt || 0);
+      this.watchdogTimeoutCount += 1;
+      this.watchdogCloseInFlight = true;
+      this.storage?.appendMetric({
+        type: "ws_watchdog_timeout",
+        idleMs,
+        timeoutMs,
+        count: this.watchdogTimeoutCount,
+      });
+      this.logger.warn("WS watchdog triggered; forcing reconnect", {
+        idleMs,
+        timeoutMs,
+        count: this.watchdogTimeoutCount,
+      });
+      try {
+        this.ws.close(4000, "watchdog_timeout");
+      } catch {
+        this.watchdogCloseInFlight = false;
+      }
+    }, intervalMs);
   }
 
   #bindEvent(ws, eventName, handler) {

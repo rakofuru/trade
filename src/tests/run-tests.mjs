@@ -14,10 +14,17 @@ import { generateReport } from "../core/reporting.mjs";
 import { normalizePerpPriceForWire, validatePerpOrderWire } from "../hyperliquid/constraints.mjs";
 import { toOrderWire } from "../hyperliquid/signing.mjs";
 import {
+  buildStrategyDecisionMetric,
   buildTpSlOrderRequests,
   computeTpSlTriggerPrices,
+  dailyLossWindowStartTs,
   shouldRefreshTpSlState,
 } from "../core/trading-engine.mjs";
+import { shouldTriggerWsWatchdog } from "../hyperliquid/ws-client.mjs";
+import {
+  buildSignal,
+  resetStrategyStateForTests,
+} from "../core/strategy-engine.mjs";
 import { analyzeRows } from "../../ops/analyze-ops.mjs";
 import { buildDailySummary, renderDailySummary } from "../../ops/daily-summary.mjs";
 import {
@@ -25,6 +32,7 @@ import {
   renderPerformanceMarkdown,
   renderPerformanceTable,
 } from "../../ops/performance-report.mjs";
+import { buildStrategyDecisionReport } from "../../ops/strategy-decision-report.mjs";
 import {
   buildPositionWhyReport,
   renderPositionWhyMarkdown,
@@ -53,6 +61,148 @@ function mkConfig(baseDir) {
 function dayKey(daysAgo) {
   const t = Date.now() - (daysAgo * 24 * 3600 * 1000);
   return new Date(t).toISOString().slice(0, 10);
+}
+
+function makeCandles({
+  length = 90,
+  base = 100,
+  drift = 0,
+  highPad = 0.2,
+  lowPad = 0.2,
+} = {}) {
+  const out = [];
+  for (let i = 0; i < length; i += 1) {
+    const close = base + (drift * i);
+    out.push({
+      ts: i * 60_000,
+      open: close,
+      high: close + highPad,
+      low: close - lowPad,
+      close,
+      volume: 10 + i,
+    });
+  }
+  return out;
+}
+
+function makeTrendBreakoutCandles() {
+  const candles = makeCandles({ length: 70, base: 100.3, drift: 0.001, highPad: 0.25, lowPad: 0.25 });
+  candles[68] = {
+    ts: 68 * 60_000,
+    open: 100.95,
+    high: 101.35,
+    low: 100.85,
+    close: 101.2,
+    volume: 40,
+  };
+  candles[69] = {
+    ts: 69 * 60_000,
+    open: 101.15,
+    high: 101.65,
+    low: 101.05,
+    close: 101.5,
+    volume: 45,
+  };
+  return candles;
+}
+
+function baseStrategyConfig() {
+  return {
+    strategySymbolDefaults: {
+      makerSpreadBps: 10,
+      makerSlippageBps: 10,
+      turbulenceRet1mPct: 0.65,
+      trendTakerTriggerPct: 0.12,
+    },
+    strategyDataStaleCandleMs: 90_000,
+    strategyDataStaleBookMs: 20_000,
+    strategyDataStaleTradesMs: 20_000,
+    strategyTurbulenceAtrMedianMult: 1.8,
+    strategyTrendAdxMin: 20,
+    strategyRangeAdxMax: 15,
+    strategyTrendEmaGapBpsMin: 8,
+    strategyRangeEmaGapBpsMax: 4,
+    strategyTrendBreakoutLookbackBars: 20,
+    strategyTrendBreakoutConfirmBars: 2,
+    strategyTrendBreakoutBufferBps: 3,
+    strategyTrendBreakoutMinBodyRatio: 0.35,
+    strategyTrendBreakoutMaxRet1mPct: 1.2,
+    strategyTrendFlowWindowSec: 20,
+    strategyTrendAggressorRatioMin: 0.55,
+    strategyTrendImbalanceThreshold: 0.1,
+    strategyRangeZEntry: 2.0,
+    strategyRangeNoBreakoutBars: 2,
+    strategyRangeMaxAtrPct: 0.9,
+    strategyRangeMaxRet1mPct: 0.45,
+    strategyTrendSlAtrMult: 1.2,
+    strategyTrendSlMinPct: 0.45,
+    strategyTrendSlMaxPct: 0.9,
+    strategyTrendTpMult: 1.3,
+    strategyTrendTimeStopMs: 12 * 60 * 1000,
+    strategyTrendTimeStopProgressR: 0.4,
+    strategyRangeSlAtrMult: 1.5,
+    strategyRangeSlMinPct: 0.55,
+    strategyRangeSlMaxPct: 1.2,
+    strategyRangeOneRTpMult: 1.0,
+    strategyRangeTimeStopMs: 6 * 60 * 1000,
+    strategyRangeTimeStopProgressR: 0.3,
+    strategyTrendMakerTtlMs: 8000,
+    strategyRangeMakerTtlMs: 10000,
+    strategyMaxEntriesPerCoinPerHour: 4,
+    strategyEntryCooldownMs: 0,
+    strategyRestartNoTradeMs: 0,
+    strategyRegimeMinHoldMs: 600000,
+    strategyRegimeConfirmBars: 2,
+    strategyRegimeFlipWindowMs: 1800000,
+    strategyRegimeFlipMaxInWindow: 4,
+    strategyRegimeFlipCooldownMs: 300000,
+    strategyMinEdgeBaseBps: 8,
+    strategyMinEdgeVolK: 1.5,
+    strategyMinEdgeSafetyBufferBps: 1,
+    strategyMinEdgeFallbackSlippageBps: 2,
+    strategyMinEdgeMakerSlipFactor: 0.65,
+    strategyFeeMakerBps: 1.8,
+    strategyFeeTakerBps: 3.6,
+    strategyFeeRefreshMs: 300000,
+  };
+}
+
+function makeMarketDataStub(overrides = {}) {
+  const candles = makeTrendBreakoutCandles();
+  return {
+    hasStaleData: () => ({ stale: false, channels: [] }),
+    lastBook: () => ({
+      ts: candles[candles.length - 1].ts,
+      spreadBps: 2.0,
+      spread: 0.2,
+      bestBid: 101.4,
+      bestAsk: 101.6,
+      mid: 101.5,
+      bidDepth: 50000,
+      askDepth: 50000,
+      levels: {
+        bids: [{ px: 101.4, sz: 10 }],
+        asks: [{ px: 101.6, sz: 10 }],
+      },
+    }),
+    estimateSlippageBps: () => 1.5,
+    atrPercent: () => 0.4,
+    atrPercentSeries: () => [0.28, 0.31, 0.33, 0.36, 0.4],
+    recentCloseReturnPct: () => 0.2,
+    ema: (_coin, interval, length) => {
+      if (interval === "15m" && length === 20) return 101.5;
+      if (interval === "15m" && length === 50) return 100.9;
+      return null;
+    },
+    adx: () => 28,
+    candlesByInterval: () => candles,
+    recentAggressiveVolumeRatio: () => 0.67,
+    top5Imbalance: () => 0.18,
+    mid: () => 101.5,
+    zScoreFromVwap: () => 2.3,
+    vwap: () => 101.0,
+    ...overrides,
+  };
 }
 
 async function testStorageRotation() {
@@ -397,6 +547,399 @@ async function testTpSlOrderRequestSideAndZeroSize() {
   assert.equal(zero.length, 0, "zero size should produce no orders");
 }
 
+async function testDailyLossWindowModes() {
+  const now = Date.parse("2026-02-18T12:34:56.789Z");
+  assert.equal(
+    dailyLossWindowStartTs(now, "utc_day"),
+    Date.parse("2026-02-18T00:00:00.000Z"),
+    "utc day mode should anchor to UTC midnight",
+  );
+  assert.equal(
+    dailyLossWindowStartTs(now, "rolling24h"),
+    now - (24 * 3600 * 1000),
+    "rolling mode should keep legacy 24h window",
+  );
+}
+
+async function testWsWatchdogTrigger() {
+  const now = 1_000_000;
+  assert.equal(
+    shouldTriggerWsWatchdog({
+      nowTs: now,
+      lastMessageAt: now - 61_000,
+      timeoutMs: 60_000,
+    }),
+    true,
+    "watchdog should fire when timeout exceeded",
+  );
+  assert.equal(
+    shouldTriggerWsWatchdog({
+      nowTs: now,
+      lastMessageAt: now - 10_000,
+      timeoutMs: 60_000,
+    }),
+    false,
+    "watchdog should stay idle while messages are fresh",
+  );
+  assert.equal(
+    shouldTriggerWsWatchdog({
+      nowTs: now,
+      lastMessageAt: 0,
+      timeoutMs: 60_000,
+    }),
+    false,
+    "watchdog should not fire without first message timestamp",
+  );
+}
+
+async function testStrategyTrendBreakoutSignal() {
+  resetStrategyStateForTests();
+  const config = baseStrategyConfig();
+  const marketData = makeMarketDataStub();
+  const signal = buildSignal({
+    arm: { id: "trend_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 1_000_000,
+  });
+  assert(signal && !signal.blocked, "trend breakout signal should be generated");
+  assert.equal(signal.strategy, "trend_breakout");
+  assert.equal(signal.regime, "TREND_UP");
+  assert.equal(signal.explanation?.feature?.reasonCode, "trend_breakout_entry");
+  assert(Number.isFinite(Number(signal.explanation?.feature?.minEdgeBps)), "entry should include minEdgeBps");
+}
+
+async function testStrategyRangeBlocksOnHighVol() {
+  resetStrategyStateForTests();
+  const config = {
+    ...baseStrategyConfig(),
+    strategyTrendAdxMin: 40,
+    strategyRangeAdxMax: 15,
+    strategyRangeMaxAtrPct: 0.8,
+  };
+  const candles = makeCandles({ length: 95, base: 100.0, drift: 0, highPad: 0.2, lowPad: 0.2 });
+  const marketData = makeMarketDataStub({
+    atrPercent: () => 0.95,
+    atrPercentSeries: () => [0.72, 0.76, 0.8, 0.82],
+    recentCloseReturnPct: () => 0.2,
+    ema: (_coin, interval, length) => {
+      if (interval === "15m" && length === 20) return 100.02;
+      if (interval === "15m" && length === 50) return 100.0;
+      return null;
+    },
+    adx: () => 10,
+    candlesByInterval: () => candles,
+    zScoreFromVwap: () => 2.4,
+    vwap: () => 99.9,
+  });
+  const signal = buildSignal({
+    arm: { id: "range_test" },
+    coin: "ETH",
+    regime: "lowvol_range_tight",
+    marketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 2_000_000,
+  });
+  assert(signal && signal.blocked, "range signal should be blocked on high volatility");
+  assert.equal(signal.reason, "NO_TRADE_RANGE_ATR");
+}
+
+async function testStrategyEntryPacingLimitPerHour() {
+  resetStrategyStateForTests();
+  const config = {
+    ...baseStrategyConfig(),
+    strategyMaxEntriesPerCoinPerHour: 1,
+    strategyEntryCooldownMs: 0,
+  };
+  const marketData = makeMarketDataStub();
+  const first = buildSignal({
+    arm: { id: "pace_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 3_000_000,
+  });
+  assert(first && !first.blocked, "first entry should pass pacing guard");
+
+  const second = buildSignal({
+    arm: { id: "pace_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 3_100_000,
+  });
+  assert(second && second.blocked, "second entry should be blocked by hourly limit");
+  assert.equal(second.reason, "NO_TRADE_ENTRY_HOURLY_LIMIT");
+  assert.equal(second.explanation?.feature?.reasonCode, "hourly_limit");
+}
+
+async function testStrategyBreakoutMinEdgeFilter() {
+  resetStrategyStateForTests();
+  const config = {
+    ...baseStrategyConfig(),
+    strategyMinEdgeBaseBps: 100,
+    strategyMinEdgeVolK: 2.0,
+    strategyMinEdgeSafetyBufferBps: 2,
+    strategyFeeTakerBps: 5,
+  };
+  const marketData = makeMarketDataStub({
+    estimateSlippageBps: () => 5,
+    atrPercent: () => 0.55,
+  });
+  const signal = buildSignal({
+    arm: { id: "edge_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 4_000_000,
+  });
+  assert(signal && signal.blocked, "signal should be blocked when breakout edge is too small");
+  assert.equal(signal.reason, "NO_TRADE_BREAKOUT_MIN_EDGE");
+  assert.equal(signal.explanation?.feature?.reasonCode, "breakout_minEdge_fail");
+  assert(
+    Number(signal.explanation?.feature?.minEdgeBps || 0) > Number(signal.explanation?.feature?.breakoutBps || 0),
+    "min edge should exceed breakout width when blocked",
+  );
+}
+
+async function testStrategyRegimeHysteresisHold() {
+  resetStrategyStateForTests();
+  const config = {
+    ...baseStrategyConfig(),
+    strategyRegimeMinHoldMs: 10 * 60 * 1000,
+    strategyRegimeConfirmBars: 1,
+  };
+
+  const trendMarketData = makeMarketDataStub();
+  const first = buildSignal({
+    arm: { id: "regime_hold_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData: trendMarketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 5_000_000,
+  });
+  assert(first && !first.blocked, "first trend signal should pass");
+
+  const rangeCandles = makeCandles({ length: 95, base: 100.0, drift: 0, highPad: 0.2, lowPad: 0.2 });
+  const rangeMarketData = makeMarketDataStub({
+    adx: () => 10,
+    ema: (_coin, interval, length) => {
+      if (interval === "15m" && length === 20) return 100.02;
+      if (interval === "15m" && length === 50) return 100.0;
+      return null;
+    },
+    candlesByInterval: () => rangeCandles,
+    zScoreFromVwap: () => 2.2,
+    vwap: () => 99.8,
+  });
+  const second = buildSignal({
+    arm: { id: "regime_hold_test" },
+    coin: "BTC",
+    regime: "lowvol_range_tight",
+    marketData: rangeMarketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 5_060_000,
+  });
+  assert(second && second.blocked, "regime switch should be held during minimum hold window");
+  assert.equal(second.reason, "NO_TRADE_REGIME_HOLD");
+  assert.equal(second.explanation?.feature?.reasonCode, "regime_hold");
+}
+
+async function testStrategyRegimeFlipChurnBlock() {
+  resetStrategyStateForTests();
+  const config = {
+    ...baseStrategyConfig(),
+    strategyRegimeMinHoldMs: 0,
+    strategyRegimeConfirmBars: 1,
+    strategyRegimeFlipWindowMs: 30 * 60 * 1000,
+    strategyRegimeFlipMaxInWindow: 1,
+    strategyRegimeFlipCooldownMs: 5 * 60 * 1000,
+    strategyMaxEntriesPerCoinPerHour: 10,
+  };
+
+  const trendMarketData = makeMarketDataStub();
+  const rangeCandles = makeCandles({ length: 95, base: 100.0, drift: 0, highPad: 0.2, lowPad: 0.2 });
+  const rangeMarketData = makeMarketDataStub({
+    adx: () => 10,
+    ema: (_coin, interval, length) => {
+      if (interval === "15m" && length === 20) return 100.02;
+      if (interval === "15m" && length === 50) return 100.0;
+      return null;
+    },
+    candlesByInterval: () => rangeCandles,
+    zScoreFromVwap: () => 2.2,
+    vwap: () => 99.8,
+  });
+
+  const first = buildSignal({
+    arm: { id: "regime_churn_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData: trendMarketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 6_000_000,
+  });
+  assert(first && !first.blocked, "first trend signal should pass");
+
+  const second = buildSignal({
+    arm: { id: "regime_churn_test" },
+    coin: "BTC",
+    regime: "lowvol_range_tight",
+    marketData: rangeMarketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 6_060_000,
+  });
+  assert(second && !second.blocked, "first flip should still pass before churn threshold");
+
+  const third = buildSignal({
+    arm: { id: "regime_churn_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData: trendMarketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: 6_120_000,
+  });
+  assert(third && third.blocked, "repeated regime flips should trigger no-trade churn block");
+  assert.equal(third.reason, "NO_TRADE_REGIME_FLIP_CHURN");
+  assert.equal(third.explanation?.feature?.reasonCode, "regime_flip_churn");
+}
+
+async function testStrategyRestartWarmupNoTrade() {
+  resetStrategyStateForTests();
+  const config = {
+    ...baseStrategyConfig(),
+    strategyRestartNoTradeMs: 300000,
+  };
+  const marketData = makeMarketDataStub();
+  const now = Date.now();
+  const signal = buildSignal({
+    arm: { id: "restart_warmup_test" },
+    coin: "BTC",
+    regime: "highvol_trend_tight",
+    marketData,
+    orderSize: 0.01,
+    maxSlippageBps: 15,
+    qualityGate: { pass: true },
+    config,
+    nowTs: now,
+  });
+  assert(signal && signal.blocked, "restart warmup should block entries after process start");
+  assert.equal(signal.reason, "NO_TRADE_RESTART_WARMUP");
+  assert.equal(signal.explanation?.feature?.reasonCode, "restart_warmup");
+  assert(Number(signal.explanation?.feature?.waitMs || 0) > 0, "warmup block should expose remaining wait time");
+}
+
+async function testStrategyDecisionMetricRequiredKeys() {
+  const metric = buildStrategyDecisionMetric({
+    action: "entry",
+    coin: "BTC",
+    regime: "TREND_UP",
+    ts: 1700000000000,
+    armId: "trend_test",
+    strategy: "trend_breakout",
+    signal: {
+      coin: "BTC",
+      regime: "TREND_UP",
+      explanation: {
+        style: "trend_breakout_continuation",
+        feature: {
+          reasonCode: "trend_breakout_entry",
+          ret1mPct: 0.21,
+          atrPct: 0.43,
+          breakoutBps: 12.5,
+          minEdgeBps: 9.8,
+          strategyContextId: "sctx_test_1",
+        },
+      },
+    },
+  });
+  assert.equal(metric.type, "strategy_decision");
+  assert.equal(metric.action, "entry");
+  assert.equal(metric.reasonCode, "trend_breakout_entry");
+  assert.equal(metric.coin, "BTC");
+  assert.equal(metric.regime, "TREND_UP");
+  assert.equal(metric.ts, 1700000000000);
+}
+
+async function testStrategyDecisionMetricSkipReasonCode() {
+  const metric = buildStrategyDecisionMetric({
+    action: "skip",
+    coin: "ETH",
+    regime: "RANGE",
+    signal: {
+      reason: "NO_TRADE_BREAKOUT_MIN_EDGE",
+      explanation: {
+        style: "trend_breakout_filter",
+        feature: {
+          reasonCode: "breakout_minEdge_fail",
+          breakoutBps: 6.2,
+          minEdgeBps: 11.4,
+        },
+      },
+    },
+  });
+  assert.equal(metric.type, "strategy_decision");
+  assert.equal(metric.action, "skip");
+  assert.equal(metric.reasonCode, "breakout_minEdge_fail");
+}
+
+async function testStrategyDecisionMetricEntryMinEdge() {
+  const metric = buildStrategyDecisionMetric({
+    action: "entry",
+    coin: "BTC",
+    regime: "TREND_UP",
+    signal: {
+      explanation: {
+        style: "trend_breakout_continuation",
+        feature: {
+          reasonCode: "trend_breakout_entry",
+          minEdgeBps: 13.75,
+          breakoutBps: 19.2,
+        },
+      },
+    },
+  });
+  assert.equal(metric.type, "strategy_decision");
+  assert.equal(metric.action, "entry");
+  assert.equal(Number(metric.minEdgeBps), 13.75);
+}
+
 async function testTpSlReduceOnlyAndPreflightBlock() {
   const validDesired = {
     asset: 1,
@@ -618,6 +1161,141 @@ async function testPerformanceReportFormats() {
   assert(markdown.includes("Top No-Trade / No-Signal Reasons"), "markdown output should include reason section");
 }
 
+function strategyDecisionFixture() {
+  const baseTs = 1700000000000;
+  return {
+    sinceTs: baseTs - 1000,
+    untilTs: baseTs + 60_000,
+    metricsRows: [
+      {
+        ts: baseTs + 1000,
+        type: "strategy_decision",
+        action: "entry",
+        reasonCode: "trend_breakout_entry",
+        coin: "BTC",
+        regime: "TREND_UP",
+        ret1mPct: 0.22,
+        atrPct: 0.44,
+        breakoutBps: 14.2,
+        minEdgeBps: 10.5,
+        cloid: "0xentry_btc_1",
+        strategyContextId: "sctx_btc_1",
+      },
+      {
+        ts: baseTs + 2000,
+        type: "strategy_decision",
+        action: "skip",
+        reasonCode: "breakout_minEdge_fail",
+        coin: "BTC",
+        regime: "TREND_UP",
+        breakoutBps: 6.2,
+        minEdgeBps: 11.8,
+      },
+      {
+        ts: baseTs + 3000,
+        type: "strategy_decision",
+        action: "skip",
+        reasonCode: "cooldown",
+        coin: "ETH",
+        regime: "RANGE",
+      },
+      {
+        ts: baseTs + 4000,
+        type: "strategy_decision",
+        action: "entry",
+        reasonCode: "range_reversion_entry",
+        coin: "ETH",
+        regime: "RANGE",
+        ret1mPct: 0.15,
+        atrPct: 0.31,
+        breakoutBps: null,
+        minEdgeBps: null,
+        cloid: "0xentry_eth_1",
+        strategyContextId: "sctx_eth_1",
+      },
+      {
+        ts: baseTs + 5000,
+        type: "strategy_decision",
+        action: "exit",
+        reasonCode: "time_stop_exit",
+        coin: "ETH",
+        regime: "RANGE",
+      },
+    ],
+    executionRows: [
+      {
+        ts: baseTs + 15_000,
+        coin: "BTC",
+        cloid: "0xentry_btc_1",
+        realizedPnl: 1.2,
+      },
+      {
+        ts: baseTs + 16_000,
+        coin: "ETH",
+        cloid: "0xentry_eth_1",
+        realizedPnl: -0.4,
+      },
+    ],
+  };
+}
+
+async function testStrategyDecisionReportActionCounts() {
+  const fixture = strategyDecisionFixture();
+  const report = buildStrategyDecisionReport({
+    metricsRows: fixture.metricsRows,
+    executionRows: fixture.executionRows,
+    sinceTs: fixture.sinceTs,
+    untilTs: fixture.untilTs,
+  });
+  assert.equal(report.kind, "strategy_decision_report_v1");
+  assert.equal(Number(report.summary.total), 5, "total decisions should aggregate");
+  assert.equal(Number(report.summary.entry), 2, "entry count should aggregate");
+  assert.equal(Number(report.summary.skip), 2, "skip count should aggregate");
+  assert.equal(Number(report.summary.exit), 1, "exit count should aggregate");
+}
+
+async function testStrategyDecisionReportReasonAggregation() {
+  const fixture = strategyDecisionFixture();
+  const report = buildStrategyDecisionReport({
+    metricsRows: fixture.metricsRows,
+    executionRows: fixture.executionRows,
+    sinceTs: fixture.sinceTs,
+    untilTs: fixture.untilTs,
+  });
+  const skipCounts = Object.fromEntries((report.reasons.skipTop || []).map((row) => [row.reasonCode, row.count]));
+  assert.equal(Number(skipCounts.breakout_minEdge_fail || 0), 1, "min edge skip reason should aggregate");
+  assert.equal(Number(skipCounts.cooldown || 0), 1, "cooldown skip reason should aggregate");
+
+  const entryCounts = Object.fromEntries((report.reasons.entryTop || []).map((row) => [row.reasonCode, row.count]));
+  assert.equal(Number(entryCounts.trend_breakout_entry || 0), 1, "trend entry reason should aggregate");
+  assert.equal(Number(entryCounts.range_reversion_entry || 0), 1, "range entry reason should aggregate");
+  assert.equal(Number(report.ratios.minEdgeSkipCount || 0), 1, "min edge skip count should be exposed");
+  assert.equal(Number(report.ratios.cooldownSkipCount || 0), 1, "cooldown skip count should be exposed");
+}
+
+async function testStrategyDecisionReportCoinRegimeAggregation() {
+  const fixture = strategyDecisionFixture();
+  const report = buildStrategyDecisionReport({
+    metricsRows: fixture.metricsRows,
+    executionRows: fixture.executionRows,
+    sinceTs: fixture.sinceTs,
+    untilTs: fixture.untilTs,
+  });
+
+  const byCoin = Object.fromEntries((report.byCoin || []).map((row) => [row.coin, row]));
+  assert.equal(Number(byCoin.BTC?.entry || 0), 1, "BTC entry count should aggregate");
+  assert.equal(Number(byCoin.BTC?.skip || 0), 1, "BTC skip count should aggregate");
+  assert.equal(Number(byCoin.ETH?.entry || 0), 1, "ETH entry count should aggregate");
+  assert.equal(Number(byCoin.ETH?.exit || 0), 1, "ETH exit count should aggregate");
+
+  const byRegime = Object.fromEntries((report.byRegime || []).map((row) => [row.regime, row]));
+  assert.equal(Number(byRegime.TREND_UP?.total || 0), 2, "TREND_UP count should aggregate");
+  assert.equal(Number(byRegime.RANGE?.total || 0), 3, "RANGE count should aggregate");
+
+  assert.equal(Number(report.executionLink.matchedExecutionCount || 0), 2, "execution link should match entry cloids");
+  assert(Math.abs(Number(report.executionLink.realizedPnlUsd || 0) - 0.8) < 1e-9, "execution link pnl should sum");
+}
+
 async function testPositionWhyReport() {
   const runtimeState = {
     positionProtectionPlansByCoin: [
@@ -727,10 +1405,25 @@ async function main() {
   await testTpSlRefreshOnSizeChange();
   await testTpSlReduceOnlyAndPreflightBlock();
   await testTpSlOrderRequestSideAndZeroSize();
+  await testDailyLossWindowModes();
+  await testWsWatchdogTrigger();
+  await testStrategyTrendBreakoutSignal();
+  await testStrategyRangeBlocksOnHighVol();
+  await testStrategyEntryPacingLimitPerHour();
+  await testStrategyBreakoutMinEdgeFilter();
+  await testStrategyRegimeHysteresisHold();
+  await testStrategyRegimeFlipChurnBlock();
+  await testStrategyRestartWarmupNoTrade();
+  await testStrategyDecisionMetricRequiredKeys();
+  await testStrategyDecisionMetricSkipReasonCode();
+  await testStrategyDecisionMetricEntryMinEdge();
   await testReportOrderCancelSplit();
   await testOpsAnalyzerInvariantDetection();
   await testDailySummaryFormatting();
   await testPerformanceReportFormats();
+  await testStrategyDecisionReportActionCounts();
+  await testStrategyDecisionReportReasonAggregation();
+  await testStrategyDecisionReportCoinRegimeAggregation();
   await testPositionWhyReport();
   console.log("All tests passed");
 }
