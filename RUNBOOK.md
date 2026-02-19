@@ -108,12 +108,13 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
 - Deploy failure emits remote diagnostics (`systemctl status hlauto`, recent `journalctl`) before retry/fail.
 - VPS deploy steps in `deploy.sh`:
   1. `git fetch/checkout` (snapshot apply fallback mode only)
-  2. `npm ci`
+  2. `npm ci` (if `HLAUTO_DEPLOY_SKIP_NPM_CI!=1`)
   3. `systemctl restart hlauto`
   4. inspect journal logs since service activation time
   - Note: journal pattern checks are warning by default. To make them hard-fail, set `HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL=1`.
 - In GitHub Actions, deploy step sets:
   - `HLAUTO_SKIP_GIT_SYNC=1`
+  - `HLAUTO_DEPLOY_SKIP_NPM_CI=1`
   - `HLAUTO_DEPLOY_SKIP_TESTS=1`
   - `HLAUTO_DEPLOY_SKIP_SELFTEST=1`
   - `HLAUTO_SKIP_OPS_SANITY=1`

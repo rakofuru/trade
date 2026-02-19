@@ -9,6 +9,7 @@ SKIP_OPS_SANITY="${HLAUTO_SKIP_OPS_SANITY:-0}"
 JOURNAL_STRICT_FAIL="${HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL:-0}"
 SKIP_GIT_SYNC="${HLAUTO_SKIP_GIT_SYNC:-0}"
 DEPLOY_SHA_OVERRIDE="${HLAUTO_DEPLOY_SHA:-}"
+SKIP_DEPLOY_NPM_CI="${HLAUTO_DEPLOY_SKIP_NPM_CI:-0}"
 SKIP_DEPLOY_TESTS="${HLAUTO_DEPLOY_SKIP_TESTS:-0}"
 SKIP_DEPLOY_SELFTEST="${HLAUTO_DEPLOY_SKIP_SELFTEST:-0}"
 TARGET_REF="${1:-main}"
@@ -105,7 +106,11 @@ fi
 
 echo "[deploy] deployed_sha=${DEPLOYED_SHA}"
 
-run_as_app npm ci
+if [[ "${SKIP_DEPLOY_NPM_CI}" == "1" ]]; then
+  echo "[deploy] skipping npm ci (HLAUTO_DEPLOY_SKIP_NPM_CI=1)"
+else
+  run_as_app npm ci
+fi
 if [[ "${SKIP_DEPLOY_TESTS}" == "1" ]]; then
   echo "[deploy] skipping npm run test (HLAUTO_DEPLOY_SKIP_TESTS=1)"
 else

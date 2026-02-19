@@ -236,6 +236,7 @@ jobs:
           export HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL="0"
           export HLAUTO_SKIP_GIT_SYNC="\${use_snapshot}"
           export HLAUTO_DEPLOY_SHA="${DEPLOY_REF}"
+          export HLAUTO_DEPLOY_SKIP_NPM_CI="1"
           export HLAUTO_DEPLOY_SKIP_TESTS="1"
           export HLAUTO_DEPLOY_SKIP_SELFTEST="1"
           bash /opt/hlauto/trade/ops/scripts/deploy.sh "${DEPLOY_REF}"
