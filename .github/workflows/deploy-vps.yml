@@ -123,68 +123,138 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare SSH client
+        shell: bash
+        env:
+          VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
+          VPS_PORT: ${{ steps.ssh_inputs.outputs.port }}
+          VPS_USER: ${{ steps.ssh_inputs.outputs.user }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          key_file="${HOME}/.ssh/hlauto_deploy_key"
+          printf '%s\n' "${VPS_SSH_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+          ssh-keyscan -p "${VPS_PORT}" -t ed25519,ecdsa,rsa "${VPS_HOST}" > "${HOME}/.ssh/known_hosts" 2>/dev/null
+          if [[ ! -s "${HOME}/.ssh/known_hosts" ]]; then
+            echo "::error::Failed to build known_hosts for ${VPS_HOST}:${VPS_PORT}"
+            exit 1
+          fi
+          chmod 600 "${HOME}/.ssh/known_hosts"
+          ssh -i "${key_file}" -p "${VPS_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${VPS_USER}@${VPS_HOST}" "echo [deploy-vps] ssh connectivity ok"
+
       - name: Deploy to VPS over SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ steps.ssh_inputs.outputs.host }}
-          port: ${{ steps.ssh_inputs.outputs.port }}
-          username: ${{ steps.ssh_inputs.outputs.user }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
-          command_timeout: 30m
-          script: |
-            export HLAUTO_APP_DIR="/opt/hlauto/trade"
-            export HLAUTO_APP_USER="trader"
-            export HLAUTO_SERVICE_NAME="hlauto"
-            bash /opt/hlauto/trade/ops/scripts/deploy.sh "${{ steps.ref.outputs.ref }}"
+        shell: bash
+        env:
+          VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
+          VPS_PORT: ${{ steps.ssh_inputs.outputs.port }}
+          VPS_USER: ${{ steps.ssh_inputs.outputs.user }}
+          DEPLOY_REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          key_file="${HOME}/.ssh/hlauto_deploy_key"
+          ssh_opts=(
+            -i "${key_file}"
+            -p "${VPS_PORT}"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+          )
+          if [[ ! "${DEPLOY_REF}" =~ ^[0-9A-Za-z._/-]{1,120}$ ]]; then
+            echo "::error::Invalid deploy_ref format: ${DEPLOY_REF}"
+            exit 1
+          fi
+          remote_cmd="$(cat <<EOF
+          set -euo pipefail
+          export HLAUTO_APP_DIR="/opt/hlauto/trade"
+          export HLAUTO_APP_USER="trader"
+          export HLAUTO_SERVICE_NAME="hlauto"
+          bash /opt/hlauto/trade/ops/scripts/deploy.sh "${DEPLOY_REF}"
+          EOF
+          )"
+          for attempt in 1 2 3; do
+            echo "[deploy-vps] deploy attempt ${attempt}/3"
+            if ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "${remote_cmd}"; then
+              exit 0
+            fi
+            if [[ "${attempt}" -lt 3 ]]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          echo "::error::Deploy to VPS failed after 3 attempts"
+          exit 1
 
       - name: Post-deploy quick check (10m, fail on invariant A/B)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ steps.ssh_inputs.outputs.host }}
-          port: ${{ steps.ssh_inputs.outputs.port }}
-          username: ${{ steps.ssh_inputs.outputs.user }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
-          command_timeout: 30m
-          script: |
-            set -euo pipefail
-            export HLAUTO_APP_DIR="/opt/hlauto/trade"
-            export HLAUTO_SERVICE_NAME="hlauto"
-            export HLAUTO_SUMMARY_SERVICE_NAME="hlauto-daily-summary"
-            bash /opt/hlauto/trade/ops/scripts/ops-sanity-check.sh \
-              --app-dir "${HLAUTO_APP_DIR}" \
-              --service "${HLAUTO_SERVICE_NAME}" \
-              --summary-service "${HLAUTO_SUMMARY_SERVICE_NAME}"
-            bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
-            report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
-            printf '%s\n' "${report_json}" >/tmp/hlauto_quick_report.json
-            node /opt/hlauto/trade/ops/assert-invariants.mjs --input /tmp/hlauto_quick_report.json --require A,B
+        shell: bash
+        env:
+          VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
+          VPS_PORT: ${{ steps.ssh_inputs.outputs.port }}
+          VPS_USER: ${{ steps.ssh_inputs.outputs.user }}
+        run: |
+          set -euo pipefail
+          key_file="${HOME}/.ssh/hlauto_deploy_key"
+          ssh_opts=(
+            -i "${key_file}"
+            -p "${VPS_PORT}"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+          )
+          remote_cmd="$(cat <<'EOF'
+          set -euo pipefail
+          export HLAUTO_APP_DIR="/opt/hlauto/trade"
+          export HLAUTO_SERVICE_NAME="hlauto"
+          export HLAUTO_SUMMARY_SERVICE_NAME="hlauto-daily-summary"
+          bash /opt/hlauto/trade/ops/scripts/ops-sanity-check.sh --app-dir "${HLAUTO_APP_DIR}" --service "${HLAUTO_SERVICE_NAME}" --summary-service "${HLAUTO_SUMMARY_SERVICE_NAME}"
+          bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
+          report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "10 minutes ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
+          printf "%s\n" "${report_json}" >/tmp/hlauto_quick_report.json
+          node /opt/hlauto/trade/ops/assert-invariants.mjs --input /tmp/hlauto_quick_report.json --require A,B
+          EOF
+          )"
+          ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "${remote_cmd}"
 
       - name: Post-deploy ops report (24h summary, warn only)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ steps.ssh_inputs.outputs.host }}
-          port: ${{ steps.ssh_inputs.outputs.port }}
-          username: ${{ steps.ssh_inputs.outputs.user }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          fingerprint: ${{ steps.ssh_inputs.outputs.fingerprint }}
-          command_timeout: 30m
-          script: |
-            set -euo pipefail
-            export HLAUTO_APP_DIR="/opt/hlauto/trade"
-            export HLAUTO_SERVICE_NAME="hlauto"
-            bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
-            report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
-            printf '%s\n' "${report_json}" | node -e '
-              const fs = require("node:fs");
-              const data = JSON.parse(fs.readFileSync(0, "utf8"));
-              const a = String(data?.invariantStatus?.A || (data?.invariants?.A?.pass ? "PASS" : "FAIL"));
-              const b = String(data?.invariantStatus?.B || (data?.invariants?.B?.pass ? "PASS" : "FAIL"));
-              const c = String(data?.invariantStatus?.C || (data?.invariants?.C?.pass ? "PASS" : "FAIL"));
-              if (a !== "PASS" || b !== "PASS" || c === "FAIL") {
-                console.log(`[ops-report] WARN 24h invariants status A/B/C=${a}/${b}/${c}`);
-              } else {
-                console.log(`[ops-report] OK 24h invariants status A/B/C=${a}/${b}/${c}`);
-              }
-            '
+        shell: bash
+        env:
+          VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
+          VPS_PORT: ${{ steps.ssh_inputs.outputs.port }}
+          VPS_USER: ${{ steps.ssh_inputs.outputs.user }}
+        run: |
+          set -euo pipefail
+          key_file="${HOME}/.ssh/hlauto_deploy_key"
+          ssh_opts=(
+            -i "${key_file}"
+            -p "${VPS_PORT}"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+          )
+          remote_cmd="$(cat <<'EOF'
+          set -euo pipefail
+          export HLAUTO_APP_DIR="/opt/hlauto/trade"
+          export HLAUTO_SERVICE_NAME="hlauto"
+          bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --summary-only
+          report_json="$(bash /opt/hlauto/trade/ops/scripts/ops-report.sh --since "24 hours ago" --service "${HLAUTO_SERVICE_NAME}" --json-only)"
+          tmp_json="$(mktemp)"
+          printf "%s\n" "${report_json}" > "${tmp_json}"
+          node -e "const fs=require(\"node:fs\"); const data=JSON.parse(fs.readFileSync(process.argv[1], \"utf8\")); const a=String(data?.invariantStatus?.A || (data?.invariants?.A?.pass ? \"PASS\" : \"FAIL\")); const b=String(data?.invariantStatus?.B || (data?.invariants?.B?.pass ? \"PASS\" : \"FAIL\")); const c=String(data?.invariantStatus?.C || (data?.invariants?.C?.pass ? \"PASS\" : \"FAIL\")); if (a !== \"PASS\" || b !== \"PASS\" || c === \"FAIL\") { console.log(`[ops-report] WARN 24h invariants status A/B/C=${a}/${b}/${c}`); } else { console.log(`[ops-report] OK 24h invariants status A/B/C=${a}/${b}/${c}`); }" "${tmp_json}"
+          rm -f "${tmp_json}"
+          EOF
+          )"
+          ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "${remote_cmd}"

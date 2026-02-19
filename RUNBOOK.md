@@ -90,7 +90,7 @@ rm -f ~/.ssh/github_actions_trader
 
 Get SSH fingerprint:
 ```bash
-# Prefer ECDSA fingerprint (drone-ssh / appleboy behavior)
+# Prefer ECDSA fingerprint
 ssh <HOST> ssh-keygen -l -f /etc/ssh/ssh_host_ecdsa_key.pub | cut -d ' ' -f2
 
 # Alternative without remote execution:
@@ -100,7 +100,8 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
 ## 4. Deploy flow
 - Trigger: push to `main` or `workflow_dispatch`.
 - Workflow checks `.env.local` is not tracked.
-- Workflow uses `appleboy/ssh-action@v1` with fingerprint verification.
+- Workflow uses native OpenSSH with host-key fingerprint preflight and strict known_hosts.
+- Deploy step has SSH retry (up to 3 attempts) for transient network failures.
 - VPS deploy steps in `deploy.sh`:
   1. `git fetch/checkout`
   2. `npm ci`
