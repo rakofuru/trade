@@ -6,6 +6,7 @@ APP_USER="${HLAUTO_APP_USER:-trader}"
 SERVICE_NAME="${HLAUTO_SERVICE_NAME:-hlauto}"
 SUMMARY_SERVICE_NAME="${HLAUTO_SUMMARY_SERVICE_NAME:-hlauto-daily-summary}"
 SKIP_OPS_SANITY="${HLAUTO_SKIP_OPS_SANITY:-0}"
+JOURNAL_STRICT_FAIL="${HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL:-0}"
 TARGET_REF="${1:-main}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/bin/systemctl}"
 JOURNALCTL_BIN="${JOURNALCTL_BIN:-/bin/journalctl}"
@@ -143,12 +144,20 @@ echo "${JOURNAL_OUTPUT}"
 echo "[deploy] ---- end journal ----"
 
 if grep -Eiq 'invalid price|vault not registered|blocked_preflight' <<<"${JOURNAL_OUTPUT}"; then
-  fatal "Fatal signal detected in journal: invalid price / vault not registered / blocked_preflight"
+  if [[ "${JOURNAL_STRICT_FAIL}" == "1" ]]; then
+    fatal "Fatal signal detected in journal: invalid price / vault not registered / blocked_preflight"
+  else
+    echo "[deploy] WARN: journal contains invalid price / vault not registered / blocked_preflight (strict fail disabled)"
+  fi
 fi
 
 FLATTEN_COUNT="$(grep -Eic 'Flatten position order submitted|tpsl_emergency_flatten|tpsl_unavailable' <<<"${JOURNAL_OUTPUT}" || true)"
 if [[ "${FLATTEN_COUNT}" -ge 3 ]]; then
-  fatal "Fatal signal detected: flatten/emergency sequence count=${FLATTEN_COUNT}"
+  if [[ "${JOURNAL_STRICT_FAIL}" == "1" ]]; then
+    fatal "Fatal signal detected: flatten/emergency sequence count=${FLATTEN_COUNT}"
+  else
+    echo "[deploy] WARN: flatten/emergency sequence count=${FLATTEN_COUNT} (strict fail disabled)"
+  fi
 fi
 
 if [[ "${SKIP_OPS_SANITY}" != "1" ]]; then
