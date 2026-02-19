@@ -309,6 +309,7 @@ jobs:
           ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "${remote_cmd}"
 
       - name: Post-deploy ops report (24h summary, warn only)
+        continue-on-error: true
         shell: bash
         env:
           VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
