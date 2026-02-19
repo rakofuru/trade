@@ -286,7 +286,7 @@ cleanup最終失敗時: `RUNTIME_KILL_SWITCH_FILE` を作成して再起動後�
   - Invariant C: 執行品質 (maker/taker, spread/slippage, taker閾値超過)
 - GitHub Actions の `deploy-vps` は deploy 後に `--summary-only` で過去24hサマリを自動出力
   - deploy前に Actions runner で `npm ci && npm run test && npm run selftest` を実行
-  - repoスナップショットをVPSへ同期し、VPS側は `HLAUTO_SKIP_GIT_SYNC=1` で deploy 実行
+  - repoスナップショット適用を先に試し、失敗時は `git fetch/checkout` にフォールバックして deploy 継続
   - 追加: deploy直後に `10 minutes ago` の quick check を実行し、Invariant A/B が FAIL なら workflow を失敗させる
   - `24h` サマリは warning 扱い（落とさない）
 

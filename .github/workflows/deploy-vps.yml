@@ -163,7 +163,9 @@ jobs:
             -o ConnectTimeout=15 \
             "${VPS_USER}@${VPS_HOST}" "echo [deploy-vps] ssh connectivity ok"
 
-      - name: Sync repository snapshot to VPS
+      - name: Upload repository snapshot to VPS (best-effort)
+        id: snapshot_upload
+        continue-on-error: true
         shell: bash
         env:
           VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
@@ -185,12 +187,7 @@ jobs:
           remote_tmp="/tmp/hlauto_repo_snapshot_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.tar.gz"
           tar --exclude=.git --exclude=.github --exclude=node_modules --exclude=.env.local --exclude=data -czf - . \
             | ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "cat > '${remote_tmp}'"
-          ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "\
-            set -euo pipefail; \
-            app_dir='/opt/hlauto/trade'; \
-            mkdir -p \"\${app_dir}\"; \
-            tar -xzf '${remote_tmp}' -C \"\${app_dir}\"; \
-            rm -f '${remote_tmp}'"
+          echo "[deploy-vps] snapshot uploaded to ${remote_tmp}"
 
       - name: Deploy to VPS over SSH
         shell: bash
@@ -218,12 +215,26 @@ jobs:
           fi
           remote_cmd="$(cat <<EOF
           set -euo pipefail
+          app_dir="/opt/hlauto/trade"
+          snapshot_path="/tmp/hlauto_repo_snapshot_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.tar.gz"
+          use_snapshot=0
+          if [[ -f "\${snapshot_path}" ]]; then
+            if mkdir -p "\${app_dir}" && tar -xzf "\${snapshot_path}" -C "\${app_dir}"; then
+              echo "[deploy-vps] snapshot apply success: \${snapshot_path}"
+              use_snapshot=1
+            else
+              echo "[deploy-vps] WARN: snapshot apply failed, fallback to git sync"
+            fi
+            rm -f "\${snapshot_path}" || true
+          else
+            echo "[deploy-vps] snapshot not found, fallback to git sync"
+          fi
           export HLAUTO_APP_DIR="/opt/hlauto/trade"
           export HLAUTO_APP_USER="${VPS_USER}"
           export HLAUTO_SERVICE_NAME="hlauto"
           export HLAUTO_SKIP_OPS_SANITY="1"
           export HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL="0"
-          export HLAUTO_SKIP_GIT_SYNC="1"
+          export HLAUTO_SKIP_GIT_SYNC="\${use_snapshot}"
           export HLAUTO_DEPLOY_SHA="${DEPLOY_REF}"
           export HLAUTO_DEPLOY_SKIP_TESTS="1"
           export HLAUTO_DEPLOY_SKIP_SELFTEST="1"
