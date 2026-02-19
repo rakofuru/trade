@@ -58,4 +58,41 @@ while [[ -n "${KILL_SWITCH_FILE}" && -f "${KILL_SWITCH_FILE}" ]]; do
 done
 
 cd "${APP_DIR}"
-exec "${NPM_BIN}" run start
+
+child_pid=""
+
+terminate_child() {
+  local sig="${1:-TERM}"
+  if [[ -z "${child_pid}" ]]; then
+    return 0
+  fi
+  if ! kill -0 "${child_pid}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Prefer process-group signal so npm + node are terminated together.
+  kill -"${sig}" "-${child_pid}" >/dev/null 2>&1 || kill -"${sig}" "${child_pid}" >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    if ! kill -0 "${child_pid}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  kill -KILL "-${child_pid}" >/dev/null 2>&1 || kill -KILL "${child_pid}" >/dev/null 2>&1 || true
+}
+
+on_term() {
+  echo "[run-bot] stop signal received; terminating child process group" >&2
+  terminate_child TERM
+  exit 0
+}
+
+trap on_term INT TERM
+
+# setsid ensures child process gets its own process group.
+setsid "${NPM_BIN}" run start &
+child_pid="$!"
+wait "${child_pid}"
+exit_code="$?"
+child_pid=""
+exit "${exit_code}"
