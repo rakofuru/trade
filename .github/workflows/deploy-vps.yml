@@ -183,7 +183,7 @@ jobs:
             -o ServerAliveCountMax=3
           )
           remote_tmp="/tmp/hlauto_repo_snapshot_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.tar.gz"
-          tar --exclude=.git --exclude=.github --exclude=node_modules --exclude=.env.local -czf - . \
+          tar --exclude=.git --exclude=.github --exclude=node_modules --exclude=.env.local --exclude=data -czf - . \
             | ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "cat > '${remote_tmp}'"
           ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "\
             set -euo pipefail; \
