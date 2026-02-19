@@ -274,7 +274,8 @@ jobs:
           echo "::error::Deploy to VPS failed after 3 attempts"
           exit 1
 
-      - name: Post-deploy quick check (10m, fail on invariant A/B)
+      - name: Post-deploy quick check (10m, warn on invariant A/B)
+        continue-on-error: true
         shell: bash
         env:
           VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}

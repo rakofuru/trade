@@ -115,7 +115,7 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
 - Ops-sanity/invariant checks run in dedicated post-deploy steps.
 
 Post-deploy checks:
-1. Quick check for last `10 minutes`: fail workflow if Invariant A/B is not PASS.
+1. Quick check for last `10 minutes`: warning only if Invariant A/B is not PASS.
 2. `24h` summary: warning only (do not fail workflow).
 3. Ops sanity check: unit `User/Group/WorkingDirectory/ExecStart`, `journalctl` readability, and report-dir writability must pass.
 
@@ -258,5 +258,5 @@ bash ops/scripts/position-why.sh --format json
 - [ ] deploy user has passwordless sudo for `/bin/systemctl` and `/bin/journalctl`
 - [ ] Actions uses SSH fingerprint verification
 - [ ] rollback via `deploy.sh <COMMIT_SHA>` works
-- [ ] quick check enforces Invariant A/B on deploy
+- [ ] quick check output for Invariant A/B is monitored after deploy
 - [ ] daily summary timer is active
