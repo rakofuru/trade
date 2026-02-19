@@ -178,6 +178,8 @@ jobs:
           export HLAUTO_APP_DIR="/opt/hlauto/trade"
           export HLAUTO_APP_USER="trader"
           export HLAUTO_SERVICE_NAME="hlauto"
+          export HLAUTO_SKIP_OPS_SANITY="1"
+          export HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL="0"
           bash /opt/hlauto/trade/ops/scripts/deploy.sh "${DEPLOY_REF}"
           EOF
           )"

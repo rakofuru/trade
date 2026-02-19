@@ -110,6 +110,7 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
   5. `systemctl restart hlauto`
   6. inspect journal logs since service activation time
   - Note: journal pattern checks are warning by default. To make them hard-fail, set `HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL=1`.
+- In GitHub Actions, deploy step sets `HLAUTO_SKIP_OPS_SANITY=1` and runs ops-sanity/invariant checks in dedicated post-deploy steps.
 
 Post-deploy checks:
 1. Quick check for last `10 minutes`: fail workflow if Invariant A/B is not PASS.
