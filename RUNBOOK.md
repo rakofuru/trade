@@ -3,9 +3,9 @@
 This runbook covers deployment and operations only. Trading logic is out of scope.
 
 ## 0. Rules
-- SSH user is `trader` only (key-based auth). No root SSH login.
+- SSH deploy user is key-based auth only (recommended: `trader`). No root SSH login.
 - Keep `.env.local` only on VPS. Never commit it.
-- `deploy.sh` runs as `trader`; it uses `sudo` only for `systemctl` and `journalctl`.
+- `deploy.sh` runs as the SSH deploy user (`VPS_USER`); it uses `sudo` only for `systemctl` and `journalctl`.
 - Unit ownership model (fixed):
   - `hlauto.service` -> `User=hlauto`, `Group=hlauto`
   - `hlauto-daily-summary.service` -> `User=trader`, `Group=trader`, `SupplementaryGroups=hlauto`
@@ -72,8 +72,8 @@ HLAUTO_APP_DIR=/opt/hlauto/trade HLAUTO_APP_USER=trader HLAUTO_SERVICE_NAME=hlau
 Create these repository secrets:
 - `VPS_HOST`
 - `VPS_PORT`
-- `VPS_USER` = `trader`
-- `VPS_SSH_KEY` (private key for trader)
+- `VPS_USER` (deploy user; recommended `trader`)
+- `VPS_SSH_KEY` (private key for deploy user)
 - `VPS_FINGERPRINT`
 
 ### 3-1. GitHub Actions SSH key handling (do not leave private key on VPS)
@@ -101,16 +101,21 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
 - Trigger: push to `main` or `workflow_dispatch`.
 - Workflow checks `.env.local` is not tracked.
 - Workflow uses native OpenSSH with host-key fingerprint preflight and strict known_hosts.
+- Workflow runs `npm ci`, `npm run test`, `npm run selftest` on GitHub Actions runner first.
+- Workflow syncs a repository snapshot (`.git/.github/node_modules/.env.local` excluded) to `/opt/hlauto/trade` on VPS.
 - Deploy step has SSH retry (up to 3 attempts) for transient network failures.
+- Deploy failure emits remote diagnostics (`systemctl status hlauto`, recent `journalctl`) before retry/fail.
 - VPS deploy steps in `deploy.sh`:
-  1. `git fetch/checkout`
-  2. `npm ci`
-  3. `npm run test`
-  4. `npm run selftest`
-  5. `systemctl restart hlauto`
-  6. inspect journal logs since service activation time
+  1. `npm ci`
+  2. `systemctl restart hlauto`
+  3. inspect journal logs since service activation time
   - Note: journal pattern checks are warning by default. To make them hard-fail, set `HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL=1`.
-- In GitHub Actions, deploy step sets `HLAUTO_SKIP_OPS_SANITY=1` and runs ops-sanity/invariant checks in dedicated post-deploy steps.
+- In GitHub Actions, deploy step sets:
+  - `HLAUTO_SKIP_GIT_SYNC=1`
+  - `HLAUTO_DEPLOY_SKIP_TESTS=1`
+  - `HLAUTO_DEPLOY_SKIP_SELFTEST=1`
+  - `HLAUTO_SKIP_OPS_SANITY=1`
+- Ops-sanity/invariant checks run in dedicated post-deploy steps.
 
 Post-deploy checks:
 1. Quick check for last `10 minutes`: fail workflow if Invariant A/B is not PASS.
@@ -252,7 +257,8 @@ bash ops/scripts/position-why.sh --format json
 ## 11. Self-audit checklist
 - [ ] `.env.local` is not committed
 - [ ] only `.env.local.example` is committed
-- [ ] `VPS_USER=trader` (SSH key auth only)
+- [ ] `VPS_USER` is deploy user with SSH key auth only
+- [ ] deploy user has passwordless sudo for `/bin/systemctl` and `/bin/journalctl`
 - [ ] Actions uses SSH fingerprint verification
 - [ ] rollback via `deploy.sh <COMMIT_SHA>` works
 - [ ] quick check enforces Invariant A/B on deploy

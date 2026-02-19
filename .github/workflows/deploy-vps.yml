@@ -1,6 +1,6 @@
 name: deploy-vps
 # Secrets contract:
-# - VPS_USER must be "trader" (SSH key auth only)
+# - VPS_USER must be an SSH key-auth deploy user with passwordless sudo for /bin/systemctl and /bin/journalctl
 # - VPS_FINGERPRINT is required for host key pinning
 
 on:
@@ -37,6 +37,20 @@ jobs:
             exit 1
           fi
           test -f .env.local.example
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: CI validation (test + selftest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run test
+          npm run selftest
 
       - name: Resolve deploy ref
         id: ref
@@ -149,6 +163,35 @@ jobs:
             -o ConnectTimeout=15 \
             "${VPS_USER}@${VPS_HOST}" "echo [deploy-vps] ssh connectivity ok"
 
+      - name: Sync repository snapshot to VPS
+        shell: bash
+        env:
+          VPS_HOST: ${{ steps.ssh_inputs.outputs.host }}
+          VPS_PORT: ${{ steps.ssh_inputs.outputs.port }}
+          VPS_USER: ${{ steps.ssh_inputs.outputs.user }}
+        run: |
+          set -euo pipefail
+          key_file="${HOME}/.ssh/hlauto_deploy_key"
+          ssh_opts=(
+            -i "${key_file}"
+            -p "${VPS_PORT}"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+          )
+          remote_tmp="/tmp/hlauto_repo_snapshot_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}.tar.gz"
+          tar --exclude=.git --exclude=.github --exclude=node_modules --exclude=.env.local -czf - . \
+            | ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "cat > '${remote_tmp}'"
+          ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "\
+            set -euo pipefail; \
+            app_dir='/opt/hlauto/trade'; \
+            mkdir -p \"\${app_dir}\"; \
+            tar -xzf '${remote_tmp}' -C \"\${app_dir}\"; \
+            rm -f '${remote_tmp}'"
+
       - name: Deploy to VPS over SSH
         shell: bash
         env:
@@ -176,11 +219,23 @@ jobs:
           remote_cmd="$(cat <<EOF
           set -euo pipefail
           export HLAUTO_APP_DIR="/opt/hlauto/trade"
-          export HLAUTO_APP_USER="trader"
+          export HLAUTO_APP_USER="${VPS_USER}"
           export HLAUTO_SERVICE_NAME="hlauto"
           export HLAUTO_SKIP_OPS_SANITY="1"
           export HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL="0"
+          export HLAUTO_SKIP_GIT_SYNC="1"
+          export HLAUTO_DEPLOY_SHA="${DEPLOY_REF}"
+          export HLAUTO_DEPLOY_SKIP_TESTS="1"
+          export HLAUTO_DEPLOY_SKIP_SELFTEST="1"
           bash /opt/hlauto/trade/ops/scripts/deploy.sh "${DEPLOY_REF}"
+          EOF
+          )"
+          diagnostic_cmd="$(cat <<'EOF'
+          set -euo pipefail
+          echo "[deploy-vps] ---- remote diagnostic start ----"
+          sudo -n /bin/systemctl status hlauto --no-pager || true
+          sudo -n /bin/journalctl --utc -u hlauto -n 200 --no-pager || true
+          echo "[deploy-vps] ---- remote diagnostic end ----"
           EOF
           )"
           for attempt in 1 2 3; do
@@ -188,6 +243,7 @@ jobs:
             if ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "${remote_cmd}"; then
               exit 0
             fi
+            ssh "${ssh_opts[@]}" "${VPS_USER}@${VPS_HOST}" "${diagnostic_cmd}" || true
             if [[ "${attempt}" -lt 3 ]]; then
               sleep $((attempt * 15))
             fi
