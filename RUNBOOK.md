@@ -103,21 +103,15 @@ ssh-keyscan -p <PORT> -t ecdsa <HOST> 2>/dev/null | ssh-keygen -lf - -E sha256 |
 - Workflow uses native OpenSSH with host-key fingerprint preflight and strict known_hosts.
 - Workflow runs `npm ci`, `npm run test`, `npm run selftest` on GitHub Actions runner first.
 - Workflow uploads a repository snapshot (`.git/.github/node_modules/.env.local/data` excluded) to VPS `/tmp` as best-effort.
-- Deploy step first tries to apply snapshot to `/opt/hlauto/trade`; if apply fails, it falls back to `git fetch/checkout`.
+- Deploy step first tries to apply snapshot to `/opt/hlauto/trade`; if apply fails, it tries `git fetch/checkout` best-effort.
 - Deploy step has SSH retry (up to 3 attempts) for transient network failures.
 - Deploy failure emits remote diagnostics (`systemctl status hlauto`, recent `journalctl`) before retry/fail.
-- VPS deploy steps in `deploy.sh`:
-  1. `git fetch/checkout` (snapshot apply fallback mode only)
-  2. `npm ci` (if `HLAUTO_DEPLOY_SKIP_NPM_CI!=1`)
-  3. `systemctl restart hlauto`
-  4. inspect journal logs since service activation time
-  - Note: journal pattern checks are warning by default. To make them hard-fail, set `HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL=1`.
-- In GitHub Actions, deploy step sets:
-  - `HLAUTO_SKIP_GIT_SYNC=1`
-  - `HLAUTO_DEPLOY_SKIP_NPM_CI=1`
-  - `HLAUTO_DEPLOY_SKIP_TESTS=1`
-  - `HLAUTO_DEPLOY_SKIP_SELFTEST=1`
-  - `HLAUTO_SKIP_OPS_SANITY=1`
+- GitHub Actions deploy path restarts service directly:
+  1. snapshot apply (best-effort)
+  2. git checkout fallback (best-effort)
+  3. `systemctl restart hlauto` and `is-active` check
+  4. recent `journalctl` tail output
+- `ops/scripts/deploy.sh` is still the manual strict deploy path (`git/npm test/selftest/journal checks`).
 - Ops-sanity/invariant checks run in dedicated post-deploy steps.
 
 Post-deploy checks:
