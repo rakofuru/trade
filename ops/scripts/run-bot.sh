@@ -2,41 +2,41 @@
 set -euo pipefail
 
 APP_DIR="${HLAUTO_APP_DIR:-/opt/hlauto/trade}"
-NPM_BIN="${NPM_BIN:-}"
+NODE_BIN="${NODE_BIN:-}"
 LOCK_FILE="${HLAUTO_LOCK_FILE:-${APP_DIR}/data/state/hlauto.lock}"
 KILL_SWITCH_FILE="${HLAUTO_KILL_SWITCH_FILE:-${RUNTIME_KILL_SWITCH_FILE:-${APP_DIR}/data/state/KILL_SWITCH}}"
 
-resolve_npm_bin() {
-  if [[ -n "${NPM_BIN}" ]]; then
-    echo "${NPM_BIN}"
+resolve_node_bin() {
+  if [[ -n "${NODE_BIN}" ]]; then
+    echo "${NODE_BIN}"
     return 0
   fi
-  if command -v npm >/dev/null 2>&1; then
-    command -v npm
+  if command -v node >/dev/null 2>&1; then
+    command -v node
     return 0
   fi
-  if [[ -x "/usr/bin/npm" ]]; then
-    echo "/usr/bin/npm"
+  if [[ -x "/usr/bin/node" ]]; then
+    echo "/usr/bin/node"
     return 0
   fi
-  if [[ -x "/usr/local/bin/npm" ]]; then
-    echo "/usr/local/bin/npm"
+  if [[ -x "/usr/local/bin/node" ]]; then
+    echo "/usr/local/bin/node"
     return 0
   fi
   return 1
 }
 
-NPM_BIN="$(resolve_npm_bin || true)"
-if [[ -z "${NPM_BIN}" ]]; then
-  echo "[run-bot] ERROR: npm binary not found. set NPM_BIN=/path/to/npm" >&2
+NODE_BIN="$(resolve_node_bin || true)"
+if [[ -z "${NODE_BIN}" ]]; then
+  echo "[run-bot] ERROR: node binary not found. set NODE_BIN=/path/to/node" >&2
   exit 1
 fi
-if [[ ! -x "${NPM_BIN}" ]]; then
-  echo "[run-bot] ERROR: NPM_BIN is not executable: ${NPM_BIN}" >&2
+if [[ ! -x "${NODE_BIN}" ]]; then
+  echo "[run-bot] ERROR: NODE_BIN is not executable: ${NODE_BIN}" >&2
   exit 1
 fi
-if [[ ! -f "${APP_DIR}/package.json" ]]; then
-  echo "[run-bot] ERROR: package.json not found under APP_DIR=${APP_DIR}" >&2
+if [[ ! -f "${APP_DIR}/src/index.mjs" ]]; then
+  echo "[run-bot] ERROR: src/index.mjs not found under APP_DIR=${APP_DIR}" >&2
   exit 1
 fi
 
@@ -90,7 +90,7 @@ on_term() {
 trap on_term INT TERM
 
 # setsid ensures child process gets its own process group.
-setsid "${NPM_BIN}" run start &
+setsid "${NODE_BIN}" src/index.mjs &
 child_pid="$!"
 wait "${child_pid}"
 exit_code="$?"
