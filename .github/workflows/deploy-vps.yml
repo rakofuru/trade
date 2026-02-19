@@ -246,6 +246,12 @@ jobs:
             fi
           fi
           sudo -n /bin/systemctl daemon-reload
+          if sudo -n /bin/systemctl cat hlauto-webhook-proxy >/dev/null 2>&1; then
+            sudo -n /bin/systemctl restart hlauto-webhook-proxy
+            sleep 1
+            sudo -n /bin/systemctl is-active --quiet hlauto-webhook-proxy
+            sudo -n /bin/systemctl status hlauto-webhook-proxy --no-pager --lines=40 || true
+          fi
           sudo -n /bin/systemctl restart hlauto
           sleep 2
           sudo -n /bin/systemctl is-active --quiet hlauto

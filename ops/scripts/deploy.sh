@@ -4,6 +4,7 @@ set -euo pipefail
 APP_DIR="${HLAUTO_APP_DIR:-/opt/hlauto/trade}"
 APP_USER="${HLAUTO_APP_USER:-trader}"
 SERVICE_NAME="${HLAUTO_SERVICE_NAME:-hlauto}"
+PROXY_SERVICE_NAME="${HLAUTO_WEBHOOK_PROXY_SERVICE_NAME:-hlauto-webhook-proxy}"
 SUMMARY_SERVICE_NAME="${HLAUTO_SUMMARY_SERVICE_NAME:-hlauto-daily-summary}"
 SKIP_OPS_SANITY="${HLAUTO_SKIP_OPS_SANITY:-0}"
 JOURNAL_STRICT_FAIL="${HLAUTO_DEPLOY_JOURNAL_STRICT_FAIL:-0}"
@@ -127,6 +128,15 @@ RESTART_REQUESTED_AT_EPOCH="$(date +%s)"
 echo "[deploy] restarting service=${SERVICE_NAME} requested_at=${RESTART_REQUESTED_AT_UTC}"
 
 run_root_cmd "${SYSTEMCTL_BIN}" daemon-reload
+if run_root_cmd "${SYSTEMCTL_BIN}" cat "${PROXY_SERVICE_NAME}" >/dev/null 2>&1; then
+  echo "[deploy] restarting service=${PROXY_SERVICE_NAME}"
+  run_root_cmd "${SYSTEMCTL_BIN}" restart "${PROXY_SERVICE_NAME}"
+  sleep 1
+  if ! run_root_cmd "${SYSTEMCTL_BIN}" is-active --quiet "${PROXY_SERVICE_NAME}"; then
+    run_root_cmd "${SYSTEMCTL_BIN}" status "${PROXY_SERVICE_NAME}" --no-pager || true
+    fatal "Service is not active after restart: ${PROXY_SERVICE_NAME}"
+  fi
+fi
 run_root_cmd "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"
 sleep 2
 

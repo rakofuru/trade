@@ -1,0 +1,17 @@
+[Unit]
+Description=HL Auto Webhook Reverse Proxy (Caddy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=HLAUTO_APP_DIR=/opt/hlauto/trade
+ExecStart=/bin/bash /opt/hlauto/trade/ops/scripts/run-webhook-proxy.sh
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

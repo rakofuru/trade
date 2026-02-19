@@ -1,0 +1,10 @@
+# Public webhook endpoint for LINE -> hlauto bridge.
+# Update the site host if you migrate domain.
+api.rakofuru.com {
+  tls internal
+  reverse_proxy 127.0.0.1:8787
+  encode gzip
+  header {
+    -Server
+  }
+}
