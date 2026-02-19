@@ -2,7 +2,8 @@ import http from "node:http";
 import { URL } from "node:url";
 import { parseBotDecisionMessage, decisionTemplateHeader } from "./decision-parser.mjs";
 import { verifyLineSignature } from "./signature.mjs";
-import { buildAskQuestionMessage } from "./ask-question.mjs";
+import { buildAskQuestionMessages } from "./ask-question.mjs";
+import { buildDailyEvaluationMessages } from "./daily-eval.mjs";
 
 const LINE_API_BASE = "https://api.line.me/v2/bot/message";
 const MAX_LINE_TEXT_LEN = 4800;
@@ -181,12 +182,50 @@ export class LineOpsBridge {
       };
     }
 
-    const text = buildAskQuestionMessage(payload);
+    const messages = buildAskQuestionMessages(payload);
+    return this.#broadcastTextMessages({
+      metricType: "line_askquestion_sent",
+      metricPayload: {
+        questionId: payload.questionId || null,
+      },
+      messages,
+    });
+  }
+
+  async sendDailyEvaluation(payload = {}) {
+    if (!this.isMessagingEnabled()) {
+      this.storage.appendMetric({
+        type: "line_daily_eval_skipped",
+        reason: "messaging_disabled",
+        allowedUserCount: this.allowedUserIds.size,
+        dateUtc: payload?.dateUtc || null,
+      });
+      return {
+        sent: false,
+        reason: "messaging_disabled",
+      };
+    }
+
+    const messages = buildDailyEvaluationMessages(payload);
+    return this.#broadcastTextMessages({
+      metricType: "line_daily_eval_sent",
+      metricPayload: {
+        dateUtc: payload?.dateUtc || null,
+      },
+      messages,
+    });
+  }
+
+  async #broadcastTextMessages({
+    metricType,
+    metricPayload = {},
+    messages = [],
+  }) {
     const failures = [];
     let sentCount = 0;
     for (const userId of this.allowedUserIds) {
       try {
-        await this.#pushText(userId, text);
+        await this.#pushTexts(userId, messages);
         sentCount += 1;
       } catch (error) {
         failures.push({
@@ -195,14 +234,17 @@ export class LineOpsBridge {
         });
       }
     }
+
     this.storage.appendMetric({
-      type: "line_askquestion_sent",
-      questionId: payload.questionId || null,
+      type: metricType,
       sentCount,
       failedCount: failures.length,
+      messageCount: messages.length,
+      ...metricPayload,
     });
     if (failures.length) {
-      this.logger.warn("LINE AskQuestion push failed for some users", {
+      this.logger.warn("LINE push failed for some users", {
+        metricType,
         failedCount: failures.length,
       });
     }
@@ -299,7 +341,7 @@ export class LineOpsBridge {
       });
       await this.#replyText(
         replyToken,
-        `コマンド形式エラー: ${parsed.message}\n先頭行は ${decisionTemplateHeader()} で開始してください。`,
+        `コマンド形式エラー: ${parsed.message}\n${decisionTemplateHeader(2)} ブロックで返信してください。`,
       );
       return;
     }
@@ -310,10 +352,12 @@ export class LineOpsBridge {
       action: command.action,
       coin: command.coin,
       userId,
+      questionId: command.questionId || null,
+      version: command.version || null,
     });
 
     if (!this.onDecision) {
-      await this.#replyText(replyToken, "コマンド受信: handler未設定のため実行されませんでした。");
+      await this.#replyText(replyToken, "コマンド受信: handler 未設定のため処理できませんでした。");
       return;
     }
 
@@ -352,8 +396,11 @@ export class LineOpsBridge {
     await this.#postLineApi("/reply", body);
   }
 
-  async #pushText(to, text) {
-    const chunks = splitTextToLineMessages(text);
+  async #pushTexts(to, texts) {
+    const chunks = [];
+    for (const text of texts || []) {
+      chunks.push(...splitTextToLineMessages(text));
+    }
     for (let i = 0; i < chunks.length; i += MAX_LINE_MESSAGES_PER_REQUEST) {
       const slice = chunks.slice(i, i + MAX_LINE_MESSAGES_PER_REQUEST);
       const body = {

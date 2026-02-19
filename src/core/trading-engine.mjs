@@ -87,6 +87,138 @@ export function dailyLossWindowStartTs(ts = Date.now(), mode = "utc_day") {
   return utcDayStartTs(now);
 }
 
+const COIN_OR_ALL = new Set(["BTC", "ETH", "ALL"]);
+const ASKQUESTION_ACTIONS = new Set([
+  "HOLD",
+  "RESUME",
+  "PAUSE",
+  "FLATTEN",
+  "CANCEL_ORDERS",
+  "CUSTOM",
+  "APPROVE",
+  "REJECT",
+]);
+const ASKQUESTION_P1_REASONS = new Set([
+  "COIN_BLOCKED",
+  "FLIP_WAIT_FLAT",
+  "TAKER_LIMIT",
+  "TAKER_STREAK_LIMIT",
+  "NO_TRADE_SLIPPAGE",
+]);
+const BLOCKED_CYCLE_ESCALATION_COUNT = 8;
+const BLOCKED_CYCLE_ESCALATION_WINDOW_MS = 30 * 60 * 1000;
+const BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS = 10 * 60 * 1000;
+
+function normalizeAskQuestionAction(value, fallback = "HOLD") {
+  const action = String(value || "").toUpperCase();
+  if (ASKQUESTION_ACTIONS.has(action)) {
+    return action;
+  }
+  const normalizedFallback = String(fallback || "HOLD").toUpperCase();
+  return ASKQUESTION_ACTIONS.has(normalizedFallback) ? normalizedFallback : "HOLD";
+}
+
+function parseDailyEvalAtUtc(value) {
+  const raw = String(value || "00:10").trim();
+  const match = raw.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) {
+    return { hour: 0, minute: 10, raw: "00:10" };
+  }
+  return {
+    hour: Number(match[1]),
+    minute: Number(match[2]),
+    raw: `${match[1]}:${match[2]}`,
+  };
+}
+
+export function resolveAskQuestionTtlDefaultAction({
+  positionSide = "flat",
+  config = {},
+} = {}) {
+  const side = String(positionSide || "flat").toLowerCase();
+  const isFlat = side === "flat" || side === "none" || side === "neutral";
+  const configured = isFlat
+    ? config.askQuestionTtlDefaultActionFlat
+    : config.askQuestionTtlDefaultActionInPosition;
+  const fallback = isFlat ? "HOLD" : "FLATTEN";
+  return normalizeAskQuestionAction(configured, fallback);
+}
+
+export function evaluateAskQuestionPolicy({
+  nowTs = Date.now(),
+  dayKey = "",
+  coin = "ALL",
+  reasonCode = "unknown",
+  state = {},
+  config = {},
+} = {}) {
+  const now = Number(nowTs || Date.now());
+  const currentDayKey = String(dayKey || utcDayKey(now));
+  const normalizedCoin = String(coin || "ALL").toUpperCase();
+  const normalizedReasonCode = sanitizeReasonCode(reasonCode);
+  const cooldownMs = Math.max(30_000, Number(config.askQuestionCooldownMs || config.lineAskQuestionCooldownMs || 1800000));
+  const reasonCooldownMs = Math.max(cooldownMs, Number(config.askQuestionReasonCooldownMs || 7200000));
+  const dailyMax = Math.max(1, Number(config.askQuestionDailyMax || 8));
+
+  const stateDayKey = String(state.dayKey || "");
+  const dailyCount = stateDayKey === currentDayKey ? Number(state.dailyCount || 0) : 0;
+  if (dailyCount >= dailyMax) {
+    return {
+      allowed: false,
+      suppressReason: "daily_cap",
+      waitMs: 0,
+      normalizedReasonCode,
+      cooldownMs,
+      reasonCooldownMs,
+      dailyMax,
+      dailyCount,
+      dayKey: currentDayKey,
+    };
+  }
+
+  const coinLastAt = Number(state.coinLastAt?.[normalizedCoin] || 0);
+  if (coinLastAt > 0 && (now - coinLastAt) < cooldownMs) {
+    return {
+      allowed: false,
+      suppressReason: "coin_cooldown",
+      waitMs: Math.max(0, cooldownMs - (now - coinLastAt)),
+      normalizedReasonCode,
+      cooldownMs,
+      reasonCooldownMs,
+      dailyMax,
+      dailyCount,
+      dayKey: currentDayKey,
+    };
+  }
+
+  const reasonLastAt = Number(state.reasonLastAt?.[normalizedReasonCode] || 0);
+  if (reasonLastAt > 0 && (now - reasonLastAt) < reasonCooldownMs) {
+    return {
+      allowed: false,
+      suppressReason: "reason_cooldown",
+      waitMs: Math.max(0, reasonCooldownMs - (now - reasonLastAt)),
+      normalizedReasonCode,
+      cooldownMs,
+      reasonCooldownMs,
+      dailyMax,
+      dailyCount,
+      dayKey: currentDayKey,
+    };
+  }
+
+  return {
+    allowed: true,
+    suppressReason: null,
+    waitMs: 0,
+    normalizedReasonCode,
+    cooldownMs,
+    reasonCooldownMs,
+    dailyMax,
+    dailyCount,
+    dayKey: currentDayKey,
+  };
+}
+
 function sanitizeReasonCode(raw) {
   const normalized = String(raw || "")
     .trim()
@@ -339,7 +471,52 @@ export class TradingEngine {
     this.manualGlobalPauseReason = String(runtime.manualGlobalPauseReason || "");
     this.lastAskQuestionAt = Math.max(0, Number(runtime.lastAskQuestionAt || 0));
     this.lastAskQuestionFingerprint = String(runtime.lastAskQuestionFingerprint || "");
+    this.askQuestionDaily = {
+      dayKey: String(runtime?.askQuestionDaily?.dayKey || utcDayKey(Date.now())),
+      count: Math.max(0, Number(runtime?.askQuestionDaily?.count || 0)),
+    };
+    this.askQuestionCoinLastAt = new Map((runtime.askQuestionCoinLastAt || []).map((x) => [
+      String(x.coin || "").toUpperCase(),
+      Math.max(0, Number(x.ts || 0)),
+    ]));
+    this.askQuestionReasonLastAt = new Map((runtime.askQuestionReasonLastAt || []).map((x) => [
+      sanitizeReasonCode(x.reasonCode),
+      Math.max(0, Number(x.ts || 0)),
+    ]));
+    this.askQuestionPending = new Map((runtime.askQuestionPending || [])
+      .map((x) => {
+        const questionId = String(x?.questionId || "");
+        if (!questionId) {
+          return null;
+        }
+        const coin = String(x?.coin || "ALL").toUpperCase();
+        return [questionId, {
+          questionId,
+          coin: COIN_OR_ALL.has(coin) ? coin : "ALL",
+          reasonCode: sanitizeReasonCode(x?.reasonCode),
+          phase: String(x?.phase || "unknown"),
+          createdAt: Math.max(0, Number(x?.createdAt || 0)),
+          dueAt: Math.max(0, Number(x?.dueAt || 0)),
+          ttlSec: Math.max(1, Number(x?.ttlSec || 300)),
+          positionSide: String(x?.positionSide || "flat").toLowerCase(),
+          signalSummary: String(x?.signalSummary || ""),
+        }];
+      })
+      .filter(Boolean));
+    this.askQuestionPendingTimers = new Map();
+    this.blockedCycleTrackerByCoin = new Map((runtime.blockedCycleTrackerByCoin || []).map((x) => [
+      String(x.coin || "").toUpperCase(),
+      {
+        count: Math.max(0, Number(x.count || 0)),
+        firstAt: Math.max(0, Number(x.firstAt || 0)),
+        lastAt: Math.max(0, Number(x.lastAt || 0)),
+        lastEscalatedAt: Math.max(0, Number(x.lastEscalatedAt || 0)),
+      },
+    ]));
+    this.lastDailyEvalSentDayKey = String(runtime.lastDailyEvalSentDayKey || "");
+    this.lastDailyEvalSentAt = Math.max(0, Number(runtime.lastDailyEvalSentAt || 0));
     this.askQuestionDispatcher = null;
+    this.dailyEvalDispatcher = null;
     if (Array.isArray(runtime.selectedCoins) && runtime.selectedCoins.length) {
       this.selectedCoins = runtime.selectedCoins;
     }
@@ -367,6 +544,7 @@ export class TradingEngine {
       this.resolveStop = resolve;
     });
 
+    this.#restoreAskQuestionPendingTimers();
     this.ws.start();
     this.#startIntervals();
 
@@ -387,46 +565,69 @@ export class TradingEngine {
     this.askQuestionDispatcher = typeof dispatcher === "function" ? dispatcher : null;
   }
 
+  setDailyEvalDispatcher(dispatcher) {
+    this.dailyEvalDispatcher = typeof dispatcher === "function" ? dispatcher : null;
+  }
+
   async handleOperatorDecision(command, context = {}) {
-    const action = String(command?.action || "").toUpperCase();
-    const coin = String(command?.coin || "ALL").toUpperCase();
-    const reason = String(command?.reason || "line_operator_decision");
+    const action = normalizeAskQuestionAction(command?.action, "HOLD");
+    const source = String(context?.source || "line");
+    const questionId = String(command?.questionId || "").trim();
+    const pending = questionId ? (this.askQuestionPending.get(questionId) || null) : null;
+    const reason = String(command?.reason || "line_operator_decision").slice(0, 200);
+    const coinRaw = String(command?.coin || pending?.coin || "ALL").toUpperCase();
+    const coin = COIN_OR_ALL.has(coinRaw)
+      ? coinRaw
+      : (COIN_OR_ALL.has(String(pending?.coin || "").toUpperCase()) ? String(pending.coin).toUpperCase() : "ALL");
     const ttlSecRaw = Number(command?.ttlSec);
     const ttlSec = Number.isFinite(ttlSecRaw) && ttlSecRaw >= 0
       ? Math.min(86400, Math.floor(ttlSecRaw))
       : 300;
+    const now = Date.now();
     const until = ttlSec > 0
-      ? (Date.now() + (ttlSec * 1000))
+      ? (now + (ttlSec * 1000))
       : Number.MAX_SAFE_INTEGER;
+
+    if (questionId) {
+      this.#resolveAskQuestionPending(questionId, {
+        at: now,
+        action,
+        source,
+        reason,
+        matched: Boolean(pending),
+      });
+    }
 
     this.storage.appendMetric({
       type: "operator_decision_received",
       action,
       coin,
       ttlSec,
-      source: context?.source || "line",
+      source,
       userId: context?.userId || null,
       reason,
+      questionId: questionId || null,
+      questionMatched: Boolean(pending),
     });
 
-    if (action === "PAUSE") {
+    if (action === "HOLD" || action === "PAUSE") {
       if (coin === "ALL") {
         this.manualGlobalPauseUntil = until;
         this.manualGlobalPauseReason = reason;
       } else {
         this.strategyBlockedCoins.set(coin, {
           until,
-          reason: "manual_pause_line",
-          dayKey: utcDayKey(Date.now()),
+          reason: action === "HOLD" ? "manual_hold_line" : "manual_pause_line",
+          dayKey: utcDayKey(now),
         });
       }
       return {
         ok: true,
-        message: `${coin} を一時停止しました (ttl=${ttlSec}s)`,
+        message: `${coin} を停止状態に設定しました (ttl=${ttlSec}s)`,
       };
     }
 
-    if (action === "RESUME") {
+    if (action === "RESUME" || action === "APPROVE") {
       if (coin === "ALL") {
         this.manualGlobalPauseUntil = 0;
         this.manualGlobalPauseReason = "";
@@ -435,7 +636,7 @@ export class TradingEngine {
       }
       return {
         ok: true,
-        message: `${coin} の一時停止を解除しました`,
+        message: `${coin} の停止状態を解除しました`,
       };
     }
 
@@ -465,25 +666,12 @@ export class TradingEngine {
         this.strategyBlockedCoins.set(coin, {
           until,
           reason: "manual_reject_line",
-          dayKey: utcDayKey(Date.now()),
+          dayKey: utcDayKey(now),
         });
       }
       return {
         ok: true,
         message: `${coin} をREJECTとしてブロックしました (ttl=${ttlSec}s)`,
-      };
-    }
-
-    if (action === "APPROVE") {
-      if (coin === "ALL") {
-        this.manualGlobalPauseUntil = 0;
-        this.manualGlobalPauseReason = "";
-      } else {
-        this.strategyBlockedCoins.delete(coin);
-      }
-      return {
-        ok: true,
-        message: `${coin} APPROVE を記録しました`,
       };
     }
 
@@ -498,6 +686,124 @@ export class TradingEngine {
       ok: false,
       message: `未対応 action: ${action}`,
     };
+  }
+
+  #restoreAskQuestionPendingTimers() {
+    if (!this.askQuestionPending.size) {
+      return;
+    }
+    for (const [questionId, row] of this.askQuestionPending.entries()) {
+      const dueAt = Number(row?.dueAt || 0);
+      if (!(dueAt > 0)) {
+        this.askQuestionPending.delete(questionId);
+        continue;
+      }
+      this.#scheduleAskQuestionPendingTimeout(questionId, dueAt);
+    }
+  }
+
+  #clearAskQuestionPendingTimer(questionId) {
+    const timer = this.askQuestionPendingTimers.get(questionId);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    this.askQuestionPendingTimers.delete(questionId);
+  }
+
+  #scheduleAskQuestionPendingTimeout(questionId, dueAt) {
+    this.#clearAskQuestionPendingTimer(questionId);
+    const waitMs = Math.max(0, Number(dueAt || 0) - Date.now());
+    const timer = setTimeout(() => {
+      this.askQuestionPendingTimers.delete(questionId);
+      this.#handleAskQuestionTimeout(questionId).catch((error) => {
+        this.storage.appendError({
+          where: "ask_question_timeout",
+          questionId,
+          error: error.message,
+        });
+      });
+    }, waitMs);
+    this.askQuestionPendingTimers.set(questionId, timer);
+  }
+
+  #resolveAskQuestionPending(questionId, result = {}) {
+    const key = String(questionId || "").trim();
+    if (!key) {
+      return null;
+    }
+    const row = this.askQuestionPending.get(key) || null;
+    this.#clearAskQuestionPendingTimer(key);
+    this.askQuestionPending.delete(key);
+    this.storage.appendMetric({
+      type: "ask_question_resolved",
+      questionId: key,
+      matched: Boolean(row),
+      source: result?.source || "line",
+      action: result?.action || null,
+      reason: result?.reason || null,
+      resolvedAt: Number(result?.at || Date.now()),
+    });
+    return row;
+  }
+
+  #registerAskQuestionPending(row = {}) {
+    const questionId = String(row?.questionId || "").trim();
+    if (!questionId) {
+      return;
+    }
+    const coin = String(row?.coin || "ALL").toUpperCase();
+    const payload = {
+      questionId,
+      coin: COIN_OR_ALL.has(coin) ? coin : "ALL",
+      reasonCode: sanitizeReasonCode(row?.reasonCode),
+      phase: String(row?.phase || "unknown"),
+      createdAt: Math.max(0, Number(row?.createdAt || Date.now())),
+      dueAt: Math.max(0, Number(row?.dueAt || (Date.now() + 300000))),
+      ttlSec: Math.max(1, Number(row?.ttlSec || 300)),
+      positionSide: String(row?.positionSide || "flat").toLowerCase(),
+      signalSummary: String(row?.signalSummary || ""),
+    };
+    this.askQuestionPending.set(questionId, payload);
+    this.#scheduleAskQuestionPendingTimeout(questionId, payload.dueAt);
+  }
+
+  async #handleAskQuestionTimeout(questionId) {
+    const key = String(questionId || "").trim();
+    if (!key) {
+      return;
+    }
+    const pending = this.askQuestionPending.get(key);
+    if (!pending) {
+      return;
+    }
+    this.askQuestionPending.delete(key);
+    this.#clearAskQuestionPendingTimer(key);
+
+    const action = resolveAskQuestionTtlDefaultAction({
+      positionSide: pending.positionSide,
+      config: this.config,
+    });
+    this.storage.appendMetric({
+      type: "ask_question_ttl_expired",
+      questionId: key,
+      coin: pending.coin,
+      reasonCode: pending.reasonCode,
+      positionSide: pending.positionSide,
+      action,
+      dueAt: pending.dueAt,
+    });
+    if (this.stopping) {
+      return;
+    }
+    await this.handleOperatorDecision({
+      questionId: key,
+      action,
+      coin: pending.coin,
+      ttlSec: pending.ttlSec,
+      reason: `askquestion_ttl_default:${pending.reasonCode}`,
+    }, {
+      source: "askquestion_ttl",
+    });
   }
 
   async requestShutdown(reason, error = null, options = {}) {
@@ -527,6 +833,10 @@ export class TradingEngine {
       clearTimeout(timer);
     }
     this.orderTtlTimers.clear();
+    for (const timer of this.askQuestionPendingTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.askQuestionPendingTimers.clear();
 
     try {
       if (this.ws) {
@@ -579,6 +889,14 @@ export class TradingEngine {
         type: "shutdown_cleanup_failed",
         reason,
         failures,
+      });
+      await this.#maybeDispatchAskQuestion({
+        phase: "p0_shutdown_cleanup_failed",
+        reason: "shutdown_cleanup_failed",
+        detail: {
+          reason,
+          failures,
+        },
       });
       this.#activateRuntimeKillSwitch(
         "shutdown_cleanup_failed",
@@ -1005,10 +1323,26 @@ export class TradingEngine {
       });
 
       if (error instanceof BudgetExceededError) {
+        await this.#maybeDispatchAskQuestion({
+          phase: "p0_budget_exhausted",
+          reason: "budget_exhausted",
+          detail: {
+            message: error.message,
+            details: error.details || null,
+          },
+        });
         await this.requestShutdown(error.message, error);
         return;
       }
       if (error instanceof RiskLimitError) {
+        await this.#maybeDispatchAskQuestion({
+          phase: "p0_risk_limit",
+          reason: "risk_limit_error",
+          detail: {
+            message: error.message,
+            details: error.details || null,
+          },
+        });
         await this.requestShutdown(error.message, error);
         return;
       }
@@ -1379,14 +1713,11 @@ export class TradingEngine {
         cycle: this.cycleCounter,
         decision,
       });
-      await this.#maybeDispatchAskQuestion({
-        phase: "cycle_blocked",
-        decision,
-        reason: decision.signal.reason || "signal_blocked",
-        detail: decision.signal?.explanation?.feature || null,
-      });
+      await this.#trackBlockedCycleAndMaybeAskQuestion(decision);
       return;
     }
+
+    this.blockedCycleTrackerByCoin.delete(String(decision.coin || "").toUpperCase());
 
     const execResult = await this.#executeSignal(decision);
     if (!execResult.submitted) {
@@ -1440,6 +1771,56 @@ export class TradingEngine {
         armId: decision.arm.id,
         strategy: decision.arm.strategy,
         signal: decision.signal,
+      },
+    });
+  }
+
+  async #trackBlockedCycleAndMaybeAskQuestion(decision) {
+    const now = Date.now();
+    const coin = String(decision?.coin || decision?.signal?.coin || "ALL").toUpperCase();
+    const reasonCode = sanitizeReasonCode(decision?.signal?.reason || "cycle_blocked");
+    const existing = this.blockedCycleTrackerByCoin.get(coin) || {
+      count: 0,
+      firstAt: now,
+      lastAt: 0,
+      lastEscalatedAt: 0,
+    };
+
+    if (existing.lastAt > 0 && (now - existing.lastAt) > BLOCKED_CYCLE_ESCALATION_WINDOW_MS) {
+      existing.count = 0;
+      existing.firstAt = now;
+    }
+    if (existing.count <= 0) {
+      existing.firstAt = now;
+    }
+    existing.count += 1;
+    existing.lastAt = now;
+    this.blockedCycleTrackerByCoin.set(coin, existing);
+
+    const ageMs = Math.max(0, now - Number(existing.firstAt || now));
+    const reasonCooldownMs = Math.max(
+      Number(this.config.askQuestionReasonCooldownMs || 7200000),
+      BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS,
+    );
+    const persistent = existing.count >= BLOCKED_CYCLE_ESCALATION_COUNT
+      && ageMs >= BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS;
+    if (!persistent) {
+      return;
+    }
+    if (existing.lastEscalatedAt > 0 && (now - existing.lastEscalatedAt) < reasonCooldownMs) {
+      return;
+    }
+    existing.lastEscalatedAt = now;
+    this.blockedCycleTrackerByCoin.set(coin, existing);
+    await this.#maybeDispatchAskQuestion({
+      phase: "cycle_blocked_persistent",
+      decision,
+      reason: "cycle_blocked_persistent",
+      detail: {
+        reasonCode,
+        blockedCount: existing.count,
+        blockedAgeMs: ageMs,
+        windowMs: BLOCKED_CYCLE_ESCALATION_WINDOW_MS,
       },
     });
   }
@@ -1763,12 +2144,14 @@ export class TradingEngine {
         armId: arm.id,
         strategy: arm.strategy,
       }));
-      await this.#maybeDispatchAskQuestion({
-        phase: "entry_guard_block",
-        decision,
-        reason: entryGuard.reason || "entry_guard_block",
-        detail: entryGuard.detail || null,
-      });
+      if (ASKQUESTION_P1_REASONS.has(String(entryGuard.reason || "").toUpperCase())) {
+        await this.#maybeDispatchAskQuestion({
+          phase: "entry_guard_block",
+          decision,
+          reason: entryGuard.reason || "entry_guard_block",
+          detail: entryGuard.detail || null,
+        });
+      }
       return {
         submitted: false,
         nonError: true,
@@ -4340,42 +4723,83 @@ export class TradingEngine {
     }
 
     const now = Date.now();
-    const cooldownMs = Math.max(30_000, Number(this.config.lineAskQuestionCooldownMs || 300000));
-    if ((now - this.lastAskQuestionAt) < cooldownMs) {
-      return;
-    }
-
-    const coin = String(decision?.coin || decision?.signal?.coin || "ALL").toUpperCase();
+    const coinRaw = String(decision?.coin || decision?.signal?.coin || detail?.coin || "ALL").toUpperCase();
+    const coin = COIN_OR_ALL.has(coinRaw) ? coinRaw : "ALL";
     const regime = String(decision?.regime || decision?.signal?.regime || "unknown");
     const signalSummary = String(
       decision?.signal?.reason
+      || decision?.signal?.reasonCode
       || decision?.signal?.explanation?.style
       || reason
       || "unknown",
     );
+    const reasonCode = sanitizeReasonCode(reason || decision?.signal?.reasonCode || signalSummary);
+    const dayKey = utcDayKey(now);
+    const policy = evaluateAskQuestionPolicy({
+      nowTs: now,
+      dayKey,
+      coin,
+      reasonCode,
+      state: {
+        dayKey: this.askQuestionDaily.dayKey,
+        dailyCount: this.askQuestionDaily.count,
+        coinLastAt: Object.fromEntries(this.askQuestionCoinLastAt.entries()),
+        reasonLastAt: Object.fromEntries(this.askQuestionReasonLastAt.entries()),
+      },
+      config: this.config,
+    });
+    if (!policy.allowed) {
+      this.storage.appendMetric({
+        type: "ask_question_suppressed",
+        phase: String(phase || "unknown"),
+        coin,
+        reasonCode: policy.normalizedReasonCode,
+        suppressReason: policy.suppressReason,
+        waitMs: policy.waitMs,
+        dailyCount: policy.dailyCount,
+        dailyMax: policy.dailyMax,
+      });
+      return;
+    }
+
     const fingerprint = crypto
       .createHash("sha1")
-      .update([phase, coin, regime, reason, signalSummary].join("|"))
+      .update([phase, coin, regime, reasonCode, signalSummary].join("|"))
       .digest("hex");
-    if (fingerprint === this.lastAskQuestionFingerprint && (now - this.lastAskQuestionAt) < (cooldownMs * 3)) {
+    if (fingerprint === this.lastAskQuestionFingerprint && (now - this.lastAskQuestionAt) < 120000) {
+      this.storage.appendMetric({
+        type: "ask_question_suppressed",
+        phase: String(phase || "unknown"),
+        coin,
+        reasonCode: policy.normalizedReasonCode,
+        suppressReason: "fingerprint_duplicate",
+      });
       return;
     }
 
     const openPositions = summarizeOpenPositions(this.lastUserState || {});
     const coinPosition = openPositions.find((x) => String(x?.coin || "").toUpperCase() === coin) || null;
-    const questionId = `ask_${now}_${coin.toLowerCase()}`;
+    const activePosition = coinPosition || openPositions[0] || null;
+    const questionId = `ask_${now}_${coin.toLowerCase()}_${crypto.randomBytes(3).toString("hex")}`;
+    const ttlSecRaw = Number(detail?.ttlSec || decision?.signal?.ttlSec || 300);
+    const ttlSec = Number.isFinite(ttlSecRaw) && ttlSecRaw > 0
+      ? Math.min(3600, Math.max(30, Math.floor(ttlSecRaw)))
+      : 300;
+    const positionSide = Number(activePosition?.size || 0) > 0
+      ? "long"
+      : (Number(activePosition?.size || 0) < 0 ? "short" : "flat");
     const options = [];
     const side = String(decision?.signal?.side || "").toLowerCase();
     if (side === "buy") {
-      options.push("ENTER_LONG", "HOLD", "REDUCE", "EXIT");
+      options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
     } else if (side === "sell") {
-      options.push("ENTER_SHORT", "HOLD", "REDUCE", "EXIT");
+      options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
     } else {
       options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
     }
 
     const dilemmas = [
-      `reason=${String(reason || "unknown")}`,
+      `reasonCode=${reasonCode}`,
       `phase=${String(phase || "unknown")}`,
       detail && typeof detail === "object"
         ? JSON.stringify(detail).slice(0, 180)
@@ -4387,29 +4811,61 @@ export class TradingEngine {
       ts: now,
       coin,
       midPx: Number(this.marketData.mid(coin) || 0),
-      positionSize: Number(coinPosition?.size || 0),
-      positionSide: Number(coinPosition?.size || 0) > 0
-        ? "long"
-        : (Number(coinPosition?.size || 0) < 0 ? "short" : "flat"),
+      positionSize: Number(activePosition?.size || 0),
+      positionSide,
       openOrders: Number(this.riskSnapshot?.openOrders || this.openOrders.size || 0),
       dailyPnlUsd: Number(this.riskSnapshot?.dailyPnl || 0),
       drawdownBps: Number(this.riskSnapshot?.drawdownBps || 0),
       regime,
       signalSummary,
+      reasonCode,
+      phase: String(phase || "unknown"),
+      ttlSec,
+      ttlDefaultActionFlat: resolveAskQuestionTtlDefaultAction({
+        positionSide: "flat",
+        config: this.config,
+      }),
+      ttlDefaultActionInPosition: resolveAskQuestionTtlDefaultAction({
+        positionSide,
+        config: this.config,
+      }),
       dilemmas,
       options,
     };
 
     try {
       const result = await this.askQuestionDispatcher(payload);
+      const nextDailyCount = policy.dayKey === this.askQuestionDaily.dayKey
+        ? (Number(this.askQuestionDaily.count || 0) + 1)
+        : 1;
+      this.askQuestionDaily = {
+        dayKey: policy.dayKey,
+        count: nextDailyCount,
+      };
+      this.askQuestionCoinLastAt.set(coin, now);
+      this.askQuestionReasonLastAt.set(policy.normalizedReasonCode, now);
       this.lastAskQuestionAt = now;
       this.lastAskQuestionFingerprint = fingerprint;
+      this.#registerAskQuestionPending({
+        questionId,
+        coin,
+        reasonCode: policy.normalizedReasonCode,
+        phase: String(phase || "unknown"),
+        createdAt: now,
+        dueAt: now + (ttlSec * 1000),
+        ttlSec,
+        positionSide,
+        signalSummary,
+      });
       this.storage.appendMetric({
         type: "ask_question_dispatched",
         questionId,
         coin,
         phase,
+        reasonCode: policy.normalizedReasonCode,
         reason,
+        ttlSec,
+        sentCount: Number(result?.sentCount || 0),
         sent: Boolean(result?.sent),
       });
     } catch (error) {
@@ -4419,9 +4875,160 @@ export class TradingEngine {
         coin,
         error: error.message,
       });
+      this.storage.appendMetric({
+        type: "ask_question_dispatch_failed",
+        questionId,
+        coin,
+        phase: String(phase || "unknown"),
+        reasonCode: policy.normalizedReasonCode,
+        error: error.message,
+      });
       this.logger.warn("AskQuestion dispatch failed", {
         questionId,
         coin,
+        error: error.message,
+      });
+    }
+  }
+
+  #resolveDailyEvalWindow(now = Date.now()) {
+    const schedule = parseDailyEvalAtUtc(this.config.dailyEvalAtUtc);
+    const todayStart = utcDayStartTs(now);
+    const scheduleTs = todayStart + ((schedule.hour * 60 + schedule.minute) * 60 * 1000);
+    if (now < scheduleTs && !this.lastDailyEvalSentDayKey) {
+      return null;
+    }
+    const dayStartTs = now >= scheduleTs
+      ? (todayStart - (24 * 3600 * 1000))
+      : (todayStart - (48 * 3600 * 1000));
+    if (!(dayStartTs > 0)) {
+      return null;
+    }
+    const dayKey = utcDayKey(dayStartTs);
+    if (this.lastDailyEvalSentDayKey === dayKey) {
+      return null;
+    }
+    return {
+      dayKey,
+      dayStartTs,
+      dayEndTs: dayStartTs + (24 * 3600 * 1000),
+      schedule,
+    };
+  }
+
+  #buildDailyEvalPayload({ dayKey, dayStartTs, dayEndTs }) {
+    const metricsRows = this.storage.readStream("metrics", { maxLines: 120000 })
+      .filter((x) => {
+        const ts = Number(x?.ts || 0);
+        return ts >= dayStartTs && ts < dayEndTs;
+      });
+    const executionRows = this.storage.readStream("execution", { maxLines: 120000 })
+      .filter((x) => {
+        const ts = Number(x?.ts || 0);
+        return ts >= dayStartTs && ts < dayEndTs;
+      });
+
+    const strategyRows = metricsRows
+      .filter((x) => String(x?.type || "") === "strategy_decision");
+    const entryCount = strategyRows.filter((x) => String(x?.action || "") === "entry").length;
+    const exitCount = strategyRows.filter((x) => String(x?.action || "") === "exit").length;
+    const realizedPnlRows = executionRows
+      .map((x) => Number(x?.realizedPnl || 0))
+      .filter((x) => Number.isFinite(x) && x !== 0);
+    const wins = realizedPnlRows.filter((x) => x > 0).length;
+    const losses = realizedPnlRows.filter((x) => x < 0).length;
+    const winRate = (wins + losses) > 0 ? (wins / (wins + losses)) : null;
+    const dailyRealizedPnlUsd = executionRows
+      .reduce((acc, row) => acc + Number(row?.realizedPnl || 0), 0);
+    const slippageEstimate = executionRows
+      .reduce((acc, row) => acc + Math.abs(Number(row?.slippageUsd || 0)), 0);
+    const rejectCount = metricsRows.filter((x) => (
+      String(x?.type || "") === "cycle_order_rejected"
+      || String(x?.type || "") === "order_submit_rejected"
+    )).length;
+    const drawdownSamples = metricsRows
+      .map((x) => Number(x?.drawdownBps ?? x?.risk?.drawdownBps ?? NaN))
+      .filter((x) => Number.isFinite(x));
+    const maxDdBps = drawdownSamples.length ? Math.max(...drawdownSamples) : 0;
+    const regimeCounts = new Map();
+    for (const row of strategyRows) {
+      const regime = String(row?.regime || "unknown");
+      if (!regime) {
+        continue;
+      }
+      regimeCounts.set(regime, (regimeCounts.get(regime) || 0) + 1);
+    }
+    const regimeSorted = Array.from(regimeCounts.entries())
+      .sort((a, b) => b[1] - a[1]);
+    const regimeTop = regimeSorted[0]
+      ? `${regimeSorted[0][0]} (${regimeSorted[0][1]})`
+      : "n/a";
+    const regimeBottom = regimeSorted.length > 1
+      ? `${regimeSorted[regimeSorted.length - 1][0]} (${regimeSorted[regimeSorted.length - 1][1]})`
+      : regimeTop;
+
+    const skipReasonCounts = new Map();
+    for (const row of strategyRows) {
+      if (String(row?.action || "") !== "skip") {
+        continue;
+      }
+      const key = String(row?.reasonCode || row?.reason || "unknown");
+      skipReasonCounts.set(key, (skipReasonCounts.get(key) || 0) + 1);
+    }
+    const skipReasonTop = Array.from(skipReasonCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([key, count]) => `${key}:${count}`)
+      .join(", ");
+
+    return {
+      dateUtc: dayKey,
+      dailyRealizedPnlUsd,
+      maxDdBps,
+      entryCount,
+      exitCount,
+      winRate,
+      slippageEstimate: Number.isFinite(slippageEstimate) ? `${slippageEstimate.toFixed(2)} USD` : "n/a",
+      rejectCount,
+      regimeTop,
+      regimeBottom,
+      watchdogCount: metricsRows.filter((x) => String(x?.type || "") === "ws_watchdog_timeout").length,
+      reconcileFailCount: metricsRows.filter((x) => String(x?.type || "") === "open_orders_reconcile_failed").length,
+      cleanupFailCount: metricsRows.filter((x) => String(x?.type || "") === "shutdown_cleanup_failed").length,
+      extraSummaryLines: skipReasonTop ? [`skipReasonTop=${skipReasonTop}`] : [],
+    };
+  }
+
+  async #maybeDispatchDailyEvaluation(now = Date.now()) {
+    if (!this.config.dailyEvalEnabled || !this.dailyEvalDispatcher) {
+      return;
+    }
+    const due = this.#resolveDailyEvalWindow(now);
+    if (!due) {
+      return;
+    }
+    const payload = this.#buildDailyEvalPayload(due);
+    try {
+      const result = await this.dailyEvalDispatcher(payload);
+      this.storage.appendMetric({
+        type: "daily_eval_dispatch_attempt",
+        dateUtc: due.dayKey,
+        sent: Boolean(result?.sent),
+        sentCount: Number(result?.sentCount || 0),
+        failedCount: Number(result?.failedCount || 0),
+      });
+      if (result?.sent) {
+        this.lastDailyEvalSentDayKey = due.dayKey;
+        this.lastDailyEvalSentAt = now;
+      }
+    } catch (error) {
+      this.storage.appendError({
+        where: "daily_eval_dispatch",
+        dateUtc: due.dayKey,
+        error: error.message,
+      });
+      this.logger.warn("Daily evaluation dispatch failed", {
+        dateUtc: due.dayKey,
         error: error.message,
       });
     }
@@ -4459,6 +5066,16 @@ export class TradingEngine {
         violations: report.stability.violations,
       });
       if (this.config.stabilityFailAction === "shutdown") {
+        await this.#maybeDispatchAskQuestion({
+          phase: "p0_stability_fail",
+          reason: "stability_fail",
+          detail: {
+            violations: report?.stability?.violations || [],
+            metrics: (report?.stability?.metrics || [])
+              .filter((x) => String(x?.status || "").toLowerCase() === "fail")
+              .slice(0, 8),
+          },
+        });
         const reason = (report.stability.violations || []).join("; ").slice(0, 240) || "unknown";
         await this.requestShutdown(`stability_fail:${reason}`);
         return;
@@ -4471,6 +5088,11 @@ export class TradingEngine {
       this.logger.warn("Stability gate warning", {
         metrics: (report.stability.metrics || []).filter((m) => m.status === "warn").map((m) => m.key),
       });
+    }
+
+    await this.#maybeDispatchDailyEvaluation(now);
+    if (this.config.llmExternalOnlyMode) {
+      return;
     }
 
     if (!this.gptAdvisor?.isEnabled()) {
@@ -4590,6 +5212,41 @@ export class TradingEngine {
       manualGlobalPauseReason: this.manualGlobalPauseReason,
       lastAskQuestionAt: this.lastAskQuestionAt,
       lastAskQuestionFingerprint: this.lastAskQuestionFingerprint,
+      askQuestionDaily: {
+        dayKey: String(this.askQuestionDaily?.dayKey || ""),
+        count: Math.max(0, Number(this.askQuestionDaily?.count || 0)),
+      },
+      askQuestionCoinLastAt: Array.from(this.askQuestionCoinLastAt.entries())
+        .map(([coin, ts]) => ({ coin, ts: Number(ts || 0) }))
+        .slice(-200),
+      askQuestionReasonLastAt: Array.from(this.askQuestionReasonLastAt.entries())
+        .map(([reasonCode, ts]) => ({ reasonCode, ts: Number(ts || 0) }))
+        .slice(-500),
+      askQuestionPending: Array.from(this.askQuestionPending.values())
+        .map((x) => ({
+          questionId: String(x?.questionId || ""),
+          coin: String(x?.coin || "ALL"),
+          reasonCode: String(x?.reasonCode || "unknown"),
+          phase: String(x?.phase || "unknown"),
+          createdAt: Number(x?.createdAt || 0),
+          dueAt: Number(x?.dueAt || 0),
+          ttlSec: Number(x?.ttlSec || 300),
+          positionSide: String(x?.positionSide || "flat"),
+          signalSummary: String(x?.signalSummary || ""),
+        }))
+        .filter((x) => x.questionId)
+        .slice(-100),
+      blockedCycleTrackerByCoin: Array.from(this.blockedCycleTrackerByCoin.entries())
+        .map(([coin, row]) => ({
+          coin: String(coin || "").toUpperCase(),
+          count: Math.max(0, Number(row?.count || 0)),
+          firstAt: Math.max(0, Number(row?.firstAt || 0)),
+          lastAt: Math.max(0, Number(row?.lastAt || 0)),
+          lastEscalatedAt: Math.max(0, Number(row?.lastEscalatedAt || 0)),
+        }))
+        .slice(-50),
+      lastDailyEvalSentDayKey: String(this.lastDailyEvalSentDayKey || ""),
+      lastDailyEvalSentAt: Math.max(0, Number(this.lastDailyEvalSentAt || 0)),
       savedAt: new Date().toISOString(),
     };
 

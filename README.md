@@ -5,7 +5,7 @@
 - 観測: raw HTTP/WS + 注文/約定/実行品質 + メトリクス + 改善履歴
 - 実行: nonce/idempotency/価格サイズ正規化/拒否別リトライ
 - 学習: `coin -> (coin×regime arm)` の階層バンディット
-- 改善: OpenAI 提案(JSON厳格) -> ガード -> カナリア -> 採用/却下/ロールバック
+- 改善: AskQuestion（例外時のみ）+ 日次評価プロンプト（外部LLM運用）
 - 安全: 予算制御 + ハードリスク制限 + 停止時キャンセル + フラット化
 
 ## 1. Setup
@@ -63,6 +63,13 @@ npm.cmd run doctor -- --hours 1
 - 目的:
   - AskQuestion（判断が必要な場面）だけを LINE へ通知
   - LINE 返信テンプレを bot が機械解釈して安全コマンドを実行
+- AskQuestion と Daily Summary は LINE へ「2通構成」で送信:
+  - 1通目: 人間向け短文サマリ
+  - 2通目: ChatGPT貼り付け用テンプレ（機械可読返信テンプレ付き）
+- AskQuestion は頻度制御付き:
+  - `ASKQUESTION_COOLDOWN_MS`（coinごとのクールダウン）
+  - `ASKQUESTION_DAILY_MAX`（日次上限）
+  - `ASKQUESTION_REASON_COOLDOWN_MS`（同一reason抑止）
 - 同一Nodeプロセス内でWebhookサーバを起動（追加常駐プロセスなし）
 - 必須ENV:
   - `LINE_CHANNEL_ID`
@@ -82,14 +89,13 @@ LINE側の作業:
 
 受け付ける返信テンプレ:
 ```text
-BOT_DECISION_V1
-action=APPROVE|REJECT|PAUSE|RESUME|FLATTEN|CANCEL_ORDERS|CUSTOM
-coin=BTC|ETH|ALL
-size=
-reason=
+BOT_DECISION_V2
+questionId=
+action=HOLD|RESUME|PAUSE|FLATTEN|CANCEL_ORDERS|CUSTOM|APPROVE|REJECT
 ttl_sec=
+reason=
 ```
-- 自由文は無視され、テンプレkey=valueのみ解釈されます
+- bot はメッセージ中の `BOT_DECISION_V2` ブロックのみ解釈します（自由文は無視）
 - 署名検証（`X-Line-Signature`）とallowlistで拒否判定します
 
 ## 4. Data Layout
@@ -195,23 +201,19 @@ cleanup最終失敗時: `RUNTIME_KILL_SWITCH_FILE` を作成して再起動後�
   - WS reconnect (`API_BUDGET_MAX_WS_RECONNECTS`)
   - 注文/取消 (`API_BUDGET_DAILY_MAX_ORDERS`, `API_BUDGET_DAILY_MAX_CANCELS`)
 - OpenAI:
-  - `OPENAI_DAILY_MAX_TOKENS` (`GPT_DAILY_MAX_TOKENS` 互換)
-  - `OPENAI_MAX_COST_USD` (`GPT_MAX_COST_USD` 互換)
-  - `OPENAI_MAX_CALLS`
-  - 超過時挙動: `OPENAI_BUDGET_EXCEEDED_ACTION=disable|shutdown`
+  - 本番botは `llmExternalOnlyMode=true` で固定され、内部から OpenAI API は呼びません。
+  - ChatGPT 利用は LINE 経由プロンプトを人間が貼り付ける外部運用です。
 
-## 9. OpenAI Improvement Loop
+## 9. External LLM Workflow
 
-- 注文判断はしない（提案のみ）
-- 入力はサニタイズ済み統計（秘密情報/識別子を除外）
-- 出力は strict JSON:
-  - `proposals[]` (`coin|param|ops|strategy`)
-  - `stop { suggest, reason, severity }`
-  - `alerts[]`
-- ガード:
-  - パラメータ範囲外は破棄
-  - カナリア検証
-  - 悪化時ロールバック + `GPT_PROPOSAL_QUARANTINE_CYCLES` で再提案を凍結
+- bot は AskQuestion 発生時に LINE へ 2通送信:
+  - 人間向けサマリ
+  - GPT用固定テンプレ（末尾に `BOT_DECISION_V2` 返信テンプレ）
+- bot が解釈するのは `BOT_DECISION_V2` ブロックのみ
+- AskQuestion のTTL期限切れ時の既定動作:
+  - flat: `ASKQUESTION_TTL_DEFAULT_ACTION_FLAT`（既定 `HOLD`）
+  - in position: `ASKQUESTION_TTL_DEFAULT_ACTION_IN_POSITION`（既定 `FLATTEN`）
+- 日次評価は `DAILY_EVAL_ENABLED` + `DAILY_EVAL_AT_UTC` で毎日1回送信
 
 ## 10. Security Notes
 
@@ -279,6 +281,13 @@ cleanup最終失敗時: `RUNTIME_KILL_SWITCH_FILE` を作成して再起動後�
   - `LINE_ALLOWED_USER_IDS`
   - `LINE_ASKQUESTION_ENABLED`
   - `LINE_ASKQUESTION_COOLDOWN_MS`
+  - `ASKQUESTION_COOLDOWN_MS`
+  - `ASKQUESTION_DAILY_MAX`
+  - `ASKQUESTION_REASON_COOLDOWN_MS`
+  - `ASKQUESTION_TTL_DEFAULT_ACTION_FLAT`
+  - `ASKQUESTION_TTL_DEFAULT_ACTION_IN_POSITION`
+  - `DAILY_EVAL_ENABLED`
+  - `DAILY_EVAL_AT_UTC`
 - TP/SL:
   - `TPSL_ENABLED`
   - `TP_BPS`

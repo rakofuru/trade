@@ -84,6 +84,15 @@ function parseMode(value, allowed, fallback) {
   return normalized;
 }
 
+function parseUtcClock(name, value, fallback) {
+  const raw = String(value || fallback || "").trim();
+  const match = raw.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) {
+    throw new Error(`${name} must be HH:MM in UTC`);
+  }
+  return `${match[1]}:${match[2]}`;
+}
+
 function ensureRequired(env, keys) {
   const missing = keys.filter((k) => !env[k]);
   if (!missing.length) {
@@ -311,6 +320,30 @@ export function loadConfig(cwd = process.cwd()) {
     lineAllowedUserIds: parseOptionalCsv(env.LINE_ALLOWED_USER_IDS),
     lineAskQuestionEnabled: parseBoolean(env.LINE_ASKQUESTION_ENABLED, true),
     lineAskQuestionCooldownMs: parseInteger("LINE_ASKQUESTION_COOLDOWN_MS", env.LINE_ASKQUESTION_COOLDOWN_MS, 300000),
+    askQuestionCooldownMs: parseInteger(
+      "ASKQUESTION_COOLDOWN_MS",
+      env.ASKQUESTION_COOLDOWN_MS ?? env.LINE_ASKQUESTION_COOLDOWN_MS,
+      1800000,
+    ),
+    askQuestionDailyMax: parseInteger("ASKQUESTION_DAILY_MAX", env.ASKQUESTION_DAILY_MAX, 8),
+    askQuestionReasonCooldownMs: parseInteger(
+      "ASKQUESTION_REASON_COOLDOWN_MS",
+      env.ASKQUESTION_REASON_COOLDOWN_MS,
+      7200000,
+    ),
+    askQuestionTtlDefaultActionFlat: parseMode(
+      env.ASKQUESTION_TTL_DEFAULT_ACTION_FLAT || "hold",
+      ["hold", "resume", "pause", "flatten", "cancel_orders"],
+      "hold",
+    ).toUpperCase(),
+    askQuestionTtlDefaultActionInPosition: parseMode(
+      env.ASKQUESTION_TTL_DEFAULT_ACTION_IN_POSITION || "flatten",
+      ["hold", "resume", "pause", "flatten", "cancel_orders"],
+      "flatten",
+    ).toUpperCase(),
+    dailyEvalEnabled: parseBoolean(env.DAILY_EVAL_ENABLED, true),
+    dailyEvalAtUtc: parseUtcClock("DAILY_EVAL_AT_UTC", env.DAILY_EVAL_AT_UTC, "00:10"),
+    llmExternalOnlyMode: true,
     rawMaxFileMb: parseNumber("RAW_MAX_FILE_MB", env.RAW_MAX_FILE_MB, 200),
     rawKeepDays: parseInteger("RAW_KEEP_DAYS", env.RAW_KEEP_DAYS, 3),
     compressedKeepDays: parseInteger("COMPRESSED_KEEP_DAYS", env.COMPRESSED_KEEP_DAYS, 30),

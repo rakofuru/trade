@@ -19,6 +19,8 @@ import {
   buildTpSlOrderRequests,
   computeTpSlTriggerPrices,
   dailyLossWindowStartTs,
+  evaluateAskQuestionPolicy,
+  resolveAskQuestionTtlDefaultAction,
   shouldRefreshTpSlState,
 } from "../core/trading-engine.mjs";
 import { shouldTriggerWsWatchdog } from "../hyperliquid/ws-client.mjs";
@@ -41,7 +43,8 @@ import {
 } from "../../ops/position-why.mjs";
 import { parseBotDecisionMessage } from "../line/decision-parser.mjs";
 import { verifyLineSignature } from "../line/signature.mjs";
-import { buildAskQuestionMessage } from "../line/ask-question.mjs";
+import { buildAskQuestionMessages } from "../line/ask-question.mjs";
+import { buildDailyEvaluationMessages } from "../line/daily-eval.mjs";
 import { isLineUserAllowed } from "../line/line-ops-bridge.mjs";
 
 function tmpDir() {
@@ -622,26 +625,37 @@ async function testLineSignatureVerification() {
 }
 
 async function testLineDecisionTemplateParsing() {
-  const valid = parseBotDecisionMessage([
-    "BOT_DECISION_V1",
+  const validV2 = parseBotDecisionMessage([
+    "free text line",
+    "```txt",
+    "BOT_DECISION_V2",
+    "questionId=ask_test_1",
     "action=PAUSE",
-    "coin=BTC",
-    "size=0.01",
-    "reason=need_review",
     "ttl_sec=300",
+    "reason=need_review",
+    "```",
+    "tail text",
   ].join("\n"));
-  assert.equal(valid.ok, true, "valid decision template should parse");
-  assert.equal(valid.command.action, "PAUSE");
-  assert.equal(valid.command.coin, "BTC");
-  assert.equal(Number(valid.command.size), 0.01);
-  assert.equal(Number(valid.command.ttlSec), 300);
+  assert.equal(validV2.ok, true, "valid V2 decision template should parse");
+  assert.equal(validV2.command.version, 2);
+  assert.equal(validV2.command.action, "PAUSE");
+  assert.equal(validV2.command.questionId, "ask_test_1");
+  assert.equal(validV2.command.coin, "ALL");
+  assert.equal(Number(validV2.command.ttlSec), 300);
 
   const invalid = parseBotDecisionMessage([
     "BOT_DECISION_V1",
+    "action=PAUSE",
+  ].join("\n"));
+  assert.equal(invalid.ok, false, "V1 template should be rejected in V2-only mode");
+  assert.equal(invalid.error, "header_missing");
+
+  const invalidAction = parseBotDecisionMessage([
+    "BOT_DECISION_V2",
     "action=DO_SOMETHING",
   ].join("\n"));
-  assert.equal(invalid.ok, false, "invalid action should be rejected");
-  assert.equal(invalid.error, "invalid_action");
+  assert.equal(invalidAction.ok, false, "invalid action should be rejected");
+  assert.equal(invalidAction.error, "invalid_action");
 }
 
 async function testLineAllowlistRejection() {
@@ -651,7 +665,7 @@ async function testLineAllowlistRejection() {
 }
 
 async function testAskQuestionPayloadFormatting() {
-  const text = buildAskQuestionMessage({
+  const messages = buildAskQuestionMessages({
     questionId: "ask_test_1",
     coin: "BTC",
     midPx: 101234.56,
@@ -665,10 +679,114 @@ async function testAskQuestionPayloadFormatting() {
     dilemmas: ["edge不足気味", "ボラ上昇中", "一時見送りか"],
     options: ["ENTER_LONG", "HOLD", "REDUCE"],
   });
-  assert(text.includes("A) 状況サマリ"), "ask question text should include section A");
-  assert(text.includes("D) ChatGPT貼り付け用プロンプト"), "ask question text should include prompt block");
-  assert(text.includes("E) LINE返信テンプレ"), "ask question text should include reply template");
-  assert(text.includes("BOT_DECISION_V1"), "reply template header should be embedded");
+  assert.equal(messages.length, 2, "ask question should be generated as two messages");
+  assert(messages[0].includes("【HL Trade Ops / AskQuestion】"), "human message title should exist");
+  assert(messages[0].includes("詰まり理由"), "human message should include reason");
+  assert(messages[1].includes("【あなたへの依頼】"), "prompt message should include request section");
+  assert(messages[1].includes("BOT_DECISION_V2"), "reply template V2 header should be embedded");
+  assert(messages[1].includes("questionId=ask_test_1"), "prompt should include questionId");
+}
+
+async function testDailyEvaluationPayloadFormatting() {
+  const messages = buildDailyEvaluationMessages({
+    dateUtc: "2026-02-20",
+    dailyRealizedPnlUsd: 123.45,
+    maxDdBps: 95.1,
+    entryCount: 10,
+    exitCount: 9,
+    winRate: 0.55,
+    slippageEstimate: "12.3 USD",
+    rejectCount: 2,
+    regimeTop: "TREND_UP (5)",
+    regimeBottom: "RANGE (2)",
+    watchdogCount: 1,
+    reconcileFailCount: 0,
+    cleanupFailCount: 0,
+  });
+  assert.equal(messages.length, 2, "daily evaluation should be generated as two messages");
+  assert(messages[0].includes("【HL Trade Ops / Daily Summary】"), "daily human summary title should exist");
+  assert(messages[1].includes("【あなたへの依頼】"), "daily prompt should include request header");
+  assert(messages[1].includes("BOT_TUNING_V1"), "daily prompt should include optional tuning block");
+}
+
+async function testAskQuestionPolicyGuards() {
+  const nowTs = Date.parse("2026-02-19T12:00:00Z");
+  const dayKeyValue = "2026-02-19";
+  const config = {
+    askQuestionCooldownMs: 1800000,
+    askQuestionDailyMax: 8,
+    askQuestionReasonCooldownMs: 7200000,
+  };
+
+  const capBlocked = evaluateAskQuestionPolicy({
+    nowTs,
+    dayKey: dayKeyValue,
+    coin: "BTC",
+    reasonCode: "cycle_blocked_persistent",
+    config,
+    state: {
+      dayKey: dayKeyValue,
+      dailyCount: 8,
+      coinLastAt: {},
+      reasonLastAt: {},
+    },
+  });
+  assert.equal(capBlocked.allowed, false, "daily cap should block ask question");
+  assert.equal(capBlocked.suppressReason, "daily_cap");
+
+  const coinCooldownBlocked = evaluateAskQuestionPolicy({
+    nowTs,
+    dayKey: dayKeyValue,
+    coin: "BTC",
+    reasonCode: "cycle_blocked_persistent",
+    config,
+    state: {
+      dayKey: dayKeyValue,
+      dailyCount: 1,
+      coinLastAt: { BTC: nowTs - 1000 },
+      reasonLastAt: {},
+    },
+  });
+  assert.equal(coinCooldownBlocked.allowed, false, "coin cooldown should block ask question");
+  assert.equal(coinCooldownBlocked.suppressReason, "coin_cooldown");
+
+  const reasonCooldownBlocked = evaluateAskQuestionPolicy({
+    nowTs,
+    dayKey: dayKeyValue,
+    coin: "ETH",
+    reasonCode: "cycle_blocked_persistent",
+    config,
+    state: {
+      dayKey: dayKeyValue,
+      dailyCount: 1,
+      coinLastAt: {},
+      reasonLastAt: { cycle_blocked_persistent: nowTs - 1000 },
+    },
+  });
+  assert.equal(reasonCooldownBlocked.allowed, false, "reason cooldown should block ask question");
+  assert.equal(reasonCooldownBlocked.suppressReason, "reason_cooldown");
+}
+
+async function testAskQuestionTtlDefaultAction() {
+  const flatAction = resolveAskQuestionTtlDefaultAction({
+    positionSide: "flat",
+    config: {},
+  });
+  assert.equal(flatAction, "HOLD", "flat TTL default should be HOLD");
+
+  const inPosAction = resolveAskQuestionTtlDefaultAction({
+    positionSide: "long",
+    config: {},
+  });
+  assert.equal(inPosAction, "FLATTEN", "in-position TTL default should be FLATTEN");
+
+  const customAction = resolveAskQuestionTtlDefaultAction({
+    positionSide: "flat",
+    config: {
+      askQuestionTtlDefaultActionFlat: "PAUSE",
+    },
+  });
+  assert.equal(customAction, "PAUSE", "configured TTL default action should be respected");
 }
 
 async function testStrategyTrendBreakoutSignal() {
@@ -1490,6 +1608,9 @@ async function main() {
   await testLineDecisionTemplateParsing();
   await testLineAllowlistRejection();
   await testAskQuestionPayloadFormatting();
+  await testDailyEvaluationPayloadFormatting();
+  await testAskQuestionPolicyGuards();
+  await testAskQuestionTtlDefaultAction();
   await testStrategyTrendBreakoutSignal();
   await testStrategyRangeBlocksOnHighVol();
   await testStrategyEntryPacingLimitPerHour();

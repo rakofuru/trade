@@ -66,6 +66,7 @@ async function main() {
     }),
   });
   engine.setAskQuestionDispatcher(async (payload) => lineBridge.sendAskQuestion(payload));
+  engine.setDailyEvalDispatcher(async (payload) => lineBridge.sendDailyEvaluation(payload));
 
   const shutdown = async (reason) => {
     await engine.requestShutdown(reason);

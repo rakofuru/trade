@@ -71,6 +71,13 @@ PUBLIC_BASE_URL=https://<your-domain>
 LINE_WEBHOOK_PATH=/line/webhook
 LINE_WEBHOOK_PORT=8787
 LINE_ALLOWED_USER_IDS=Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ASKQUESTION_COOLDOWN_MS=1800000
+ASKQUESTION_DAILY_MAX=8
+ASKQUESTION_REASON_COOLDOWN_MS=7200000
+ASKQUESTION_TTL_DEFAULT_ACTION_FLAT=HOLD
+ASKQUESTION_TTL_DEFAULT_ACTION_IN_POSITION=FLATTEN
+DAILY_EVAL_ENABLED=true
+DAILY_EVAL_AT_UTC=00:10
 ```
 - LINE Developers の Webhook URL は `PUBLIC_BASE_URL + LINE_WEBHOOK_PATH` を設定
 - 受信経路（reverse proxy / firewall）で `LINE_WEBHOOK_PORT` まで到達できることを確認
@@ -184,8 +191,13 @@ Runtime guardrails (always-on):
 - Stability fail action default is `STABILITY_FAIL_ACTION=shutdown` (fail-open禁止).
 - LINE webhook security: `X-Line-Signature` を `LINE_CHANNEL_SECRET` で検証
 - LINE operator allowlist: `LINE_ALLOWED_USER_IDS` 以外は拒否
-- LINE command format: `BOT_DECISION_V1` + key=value のみ解釈（自由文は無視）
+- LINE command format: `BOT_DECISION_V2` ブロックのみ解釈（自由文は無視）
 - LINE actions: `APPROVE / REJECT / PAUSE / RESUME / FLATTEN / CANCEL_ORDERS / CUSTOM`
+- AskQuestion は 2通送信（人間向け短文 + GPT貼り付け用テンプレ）
+- AskQuestion TTL切れ時の既定動作:
+  - flat: `ASKQUESTION_TTL_DEFAULT_ACTION_FLAT`（既定 `HOLD`）
+  - in position: `ASKQUESTION_TTL_DEFAULT_ACTION_IN_POSITION`（既定 `FLATTEN`）
+- Daily evaluation は `DAILY_EVAL_AT_UTC` に 1日1回、LINEへ2通送信
 
 ## 7. Invariant report (on-demand)
 ```bash
@@ -289,6 +301,9 @@ bash ops/scripts/position-why.sh --format json
 6. allowlist拒否:
    - `line_webhook_rejected reason=allowlist_denied` を確認
    - 友だち追加済み運用者の `userId` を `LINE_ALLOWED_USER_IDS` に追加
+7. コマンド形式エラー:
+   - `line_command_invalid` を確認
+   - 返信本文に `BOT_DECISION_V2` ブロックがあるか確認
 
 ## 11. Self-audit checklist
 - [ ] `.env.local` is not committed
