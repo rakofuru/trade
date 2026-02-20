@@ -2,7 +2,7 @@ import http from "node:http";
 import { URL } from "node:url";
 import { parseBotDecisionMessage, decisionTemplateHeader } from "./decision-parser.mjs";
 import { verifyLineSignature } from "./signature.mjs";
-import { buildAskQuestionMessages } from "./ask-question.mjs";
+import { buildAskQuestionMessages, buildAskQuestionQuickReply } from "./ask-question.mjs";
 import { buildDailyEvaluationMessages } from "./daily-eval.mjs";
 
 const LINE_API_BASE = "https://api.line.me/v2/bot/message";
@@ -183,12 +183,27 @@ export class LineOpsBridge {
     }
 
     const messages = buildAskQuestionMessages(payload);
-    return this.#broadcastTextMessages({
+    const quickReply = buildAskQuestionQuickReply(payload);
+    const lineMessages = [];
+    if (messages[0]) {
+      lineMessages.push({
+        type: "text",
+        text: String(messages[0]),
+        quickReply,
+      });
+    }
+    for (const text of messages.slice(1)) {
+      lineMessages.push({
+        type: "text",
+        text: String(text),
+      });
+    }
+    return this.#broadcastLineMessages({
       metricType: "line_askquestion_sent",
       metricPayload: {
         questionId: payload.questionId || null,
       },
-      messages,
+      messages: lineMessages,
     });
   }
 
@@ -226,6 +241,45 @@ export class LineOpsBridge {
     for (const userId of this.allowedUserIds) {
       try {
         await this.#pushTexts(userId, messages);
+        sentCount += 1;
+      } catch (error) {
+        failures.push({
+          userId,
+          error: error.message,
+        });
+      }
+    }
+
+    this.storage.appendMetric({
+      type: metricType,
+      sentCount,
+      failedCount: failures.length,
+      messageCount: messages.length,
+      ...metricPayload,
+    });
+    if (failures.length) {
+      this.logger.warn("LINE push failed for some users", {
+        metricType,
+        failedCount: failures.length,
+      });
+    }
+    return {
+      sent: sentCount > 0,
+      sentCount,
+      failedCount: failures.length,
+    };
+  }
+
+  async #broadcastLineMessages({
+    metricType,
+    metricPayload = {},
+    messages = [],
+  }) {
+    const failures = [];
+    let sentCount = 0;
+    for (const userId of this.allowedUserIds) {
+      try {
+        await this.#pushLineMessages(userId, messages);
         sentCount += 1;
       } catch (error) {
         failures.push({
@@ -406,6 +460,40 @@ export class LineOpsBridge {
       const body = {
         to,
         messages: slice.map((chunk) => ({ type: "text", text: chunk })),
+      };
+      await this.#postLineApi("/push", body);
+    }
+  }
+
+  async #pushLineMessages(to, lineMessages) {
+    const messages = [];
+    for (const item of lineMessages || []) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      if (String(item.type || "") !== "text") {
+        continue;
+      }
+      const chunks = splitTextToLineMessages(String(item.text || ""));
+      for (let i = 0; i < chunks.length; i += 1) {
+        const msg = {
+          type: "text",
+          text: chunks[i],
+        };
+        // Keep quick reply only on the first chunk.
+        if (i === 0 && item.quickReply && Array.isArray(item.quickReply.items) && item.quickReply.items.length) {
+          msg.quickReply = {
+            items: item.quickReply.items.slice(0, 13),
+          };
+        }
+        messages.push(msg);
+      }
+    }
+    for (let i = 0; i < messages.length; i += MAX_LINE_MESSAGES_PER_REQUEST) {
+      const slice = messages.slice(i, i + MAX_LINE_MESSAGES_PER_REQUEST);
+      const body = {
+        to,
+        messages: slice,
       };
       await this.#postLineApi("/push", body);
     }

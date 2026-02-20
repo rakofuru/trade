@@ -203,6 +203,8 @@ Runtime guardrails (always-on):
 - LINE command format: `BOT_DECISION_V2` ブロックのみ解釈（自由文は無視）
 - LINE actions: `RESUME / REJECT / PAUSE / HOLD / FLATTEN / CANCEL_ORDERS / CUSTOM`
 - `APPROVE` は互換入力として受理するが内部では `RESUME` に正規化
+- AskQuestion 1通目のクイックリプライ:
+  - `✅ RESUME` / `⏸ PAUSE` / `🟨 HOLD` / `❌ REJECT`
 - AskQuestion は 2通送信（人間向け短文 + GPT貼り付け用テンプレ）
 - AskQuestion TTL切れ時の既定動作:
   - flat: `ASKQUESTION_TTL_DEFAULT_ACTION_FLAT`（既定 `HOLD`）

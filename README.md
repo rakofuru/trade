@@ -66,6 +66,9 @@ npm.cmd run doctor -- --hours 1
 - AskQuestion と Daily Summary は LINE へ「2通構成」で送信:
   - 1通目: 人間向け短文サマリ
   - 2通目: ChatGPT貼り付け用テンプレ（機械可読返信テンプレ付き）
+- AskQuestion 1通目にはクイックリプライを付与:
+  - `✅ RESUME` / `⏸ PAUSE` / `🟨 HOLD` / `❌ REJECT`
+  - タップすると `BOT_DECISION_V2` ブロックが自動入力されます
 - AskQuestion は頻度制御付き:
   - `ASKQUESTION_COOLDOWN_MS`（coinごとのクールダウン）
   - `ASKQUESTION_DAILY_MAX`（日次上限）

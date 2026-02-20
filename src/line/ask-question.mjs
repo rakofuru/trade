@@ -155,6 +155,34 @@ export function buildAskQuestionMessages(payload = {}) {
   ];
 }
 
+export function buildAskQuestionQuickReply(payload = {}) {
+  const p = normalize(payload);
+  const ttlSec = Math.min(3600, Math.max(30, Number(p.ttlSec || 300)));
+  const questionId = String(p.questionId || "");
+  const mkAction = (label, action, reason) => ({
+    type: "action",
+    action: {
+      type: "message",
+      label,
+      text: buildDecisionTemplate({
+        version: 2,
+        questionId,
+        action,
+        ttlSec,
+        reason,
+      }),
+    },
+  });
+  return {
+    items: [
+      mkAction("✅ RESUME", "RESUME", "line_quick_resume"),
+      mkAction("⏸ PAUSE", "PAUSE", "line_quick_pause"),
+      mkAction("🟨 HOLD", "HOLD", "line_quick_hold"),
+      mkAction("❌ REJECT", "REJECT", "line_quick_reject"),
+    ],
+  };
+}
+
 export function buildAskQuestionMessage(payload = {}) {
   return buildAskQuestionMessages(payload).join("\n\n");
 }

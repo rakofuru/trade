@@ -44,7 +44,7 @@ import {
 } from "../../ops/position-why.mjs";
 import { parseBotDecisionMessage } from "../line/decision-parser.mjs";
 import { verifyLineSignature } from "../line/signature.mjs";
-import { buildAskQuestionMessages } from "../line/ask-question.mjs";
+import { buildAskQuestionMessages, buildAskQuestionQuickReply } from "../line/ask-question.mjs";
 import { buildDailyEvaluationMessages } from "../line/daily-eval.mjs";
 import { isLineUserAllowed } from "../line/line-ops-bridge.mjs";
 
@@ -698,6 +698,19 @@ async function testAskQuestionPayloadFormatting() {
   assert(messages[1].includes("【あなたへの依頼】"), "prompt message should include request section");
   assert(messages[1].includes("BOT_DECISION_V2"), "reply template V2 header should be embedded");
   assert(messages[1].includes("questionId=ask_test_1"), "prompt should include questionId");
+}
+
+async function testAskQuestionQuickReplyPayload() {
+  const quickReply = buildAskQuestionQuickReply({
+    questionId: "ask_test_2",
+    ttlSec: 300,
+  });
+  assert(Array.isArray(quickReply.items), "quick reply items should exist");
+  assert.equal(quickReply.items.length, 4, "quick reply should have 4 actions");
+  const firstText = String(quickReply.items[0]?.action?.text || "");
+  assert(firstText.includes("BOT_DECISION_V2"), "quick reply action should include BOT_DECISION_V2");
+  assert(firstText.includes("questionId=ask_test_2"), "quick reply action should include questionId");
+  assert(firstText.includes("action=RESUME"), "quick reply action should map to RESUME");
 }
 
 async function testDailyEvaluationPayloadFormatting() {
@@ -1679,6 +1692,7 @@ async function main() {
   await testLineDecisionTemplateParsing();
   await testLineAllowlistRejection();
   await testAskQuestionPayloadFormatting();
+  await testAskQuestionQuickReplyPayload();
   await testDailyEvaluationPayloadFormatting();
   await testAskQuestionTriggerGate();
   await testAskQuestionPolicyGuards();
