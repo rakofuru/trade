@@ -20,6 +20,7 @@ import {
   computeTpSlTriggerPrices,
   dailyLossWindowStartTs,
   evaluateAskQuestionPolicy,
+  evaluateAskQuestionTriggerGate,
   resolveAskQuestionTtlDefaultAction,
   shouldRefreshTpSlState,
 } from "../core/trading-engine.mjs";
@@ -656,6 +657,13 @@ async function testLineDecisionTemplateParsing() {
   ].join("\n"));
   assert.equal(invalidAction.ok, false, "invalid action should be rejected");
   assert.equal(invalidAction.error, "invalid_action");
+
+  const approveAlias = parseBotDecisionMessage([
+    "BOT_DECISION_V2",
+    "action=APPROVE",
+  ].join("\n"));
+  assert.equal(approveAlias.ok, true, "APPROVE alias should parse");
+  assert.equal(approveAlias.command.action, "RESUME", "APPROVE should normalize to RESUME");
 }
 
 async function testLineAllowlistRejection() {
@@ -671,17 +679,22 @@ async function testAskQuestionPayloadFormatting() {
     midPx: 101234.56,
     positionSize: 0.01,
     positionSide: "long",
+    positionNotional: 1012.34,
     openOrders: 2,
     dailyPnlUsd: 12.34,
     drawdownBps: 45.6,
     regime: "TREND_UP",
     signalSummary: "breakout_minEdge_borderline",
-    dilemmas: ["edge不足気味", "ボラ上昇中", "一時見送りか"],
-    options: ["ENTER_LONG", "HOLD", "REDUCE"],
+    recommendedAction: "HOLD",
+    approvedAction: "RESUME",
+    triggerReasons: ["blocked_persistent_growth"],
+    dilemmas: ["edge不足", "ボラ高止まり", "方向感なし"],
+    options: ["APPROVE(RESUME)", "PAUSE", "DETAIL"],
   });
   assert.equal(messages.length, 2, "ask question should be generated as two messages");
   assert(messages[0].includes("【HL Trade Ops / AskQuestion】"), "human message title should exist");
-  assert(messages[0].includes("詰まり理由"), "human message should include reason");
+  assert(messages[0].includes("recommendedAction=HOLD"), "human message should include recommendedAction");
+  assert(messages[0].includes("approvedAction=RESUME"), "human message should include approvedAction");
   assert(messages[1].includes("【あなたへの依頼】"), "prompt message should include request section");
   assert(messages[1].includes("BOT_DECISION_V2"), "reply template V2 header should be embedded");
   assert(messages[1].includes("questionId=ask_test_1"), "prompt should include questionId");
@@ -707,6 +720,64 @@ async function testDailyEvaluationPayloadFormatting() {
   assert(messages[0].includes("【HL Trade Ops / Daily Summary】"), "daily human summary title should exist");
   assert(messages[1].includes("【あなたへの依頼】"), "daily prompt should include request header");
   assert(messages[1].includes("BOT_TUNING_V1"), "daily prompt should include optional tuning block");
+}
+
+async function testAskQuestionTriggerGate() {
+  const config = {
+    askQuestionTriggerDrawdownBps: 150,
+    askQuestionTriggerDailyPnlUsd: -10,
+    askQuestionTriggerPositionNotionalRatio: 0.8,
+    riskMaxPositionNotionalUsd: 120,
+    askQuestionTriggerReconcileFailureStreak: 2,
+    askQuestionTriggerWsTimeouts15m: 2,
+    askQuestionTriggerBlockedAgeMs: 1800000,
+    askQuestionTriggerBlockedGrowth15m: 50,
+    askQuestionSuppressFlatLowRisk: true,
+  };
+
+  const suppressed = evaluateAskQuestionTriggerGate({
+    phase: "cycle_blocked_persistent",
+    reasonCode: "no_trade_regime",
+    signalSummary: "NO_TRADE_REGIME",
+    positionSide: "flat",
+    riskSnapshot: {
+      dailyPnl: -1,
+      drawdownBps: 0.22,
+      openOrders: 0,
+      positionNotional: 0,
+    },
+    config,
+    openOrdersReconcileFailureStreak: 0,
+    wsWatchdogTimeoutCountWindow: 0,
+    blockedAgeMs: 5 * 60 * 1000,
+    blockedCountDeltaWindow: 5,
+  });
+  assert.equal(suppressed.allowed, false, "flat low-risk no-trade should be suppressed");
+  assert.equal(suppressed.suppressReason, "flat_low_risk_no_trade");
+
+  const triggered = evaluateAskQuestionTriggerGate({
+    phase: "cycle_blocked_persistent",
+    reasonCode: "cycle_blocked_persistent",
+    signalSummary: "waiting_signal",
+    positionSide: "long",
+    riskSnapshot: {
+      dailyPnl: -12,
+      drawdownBps: 180,
+      openOrders: 1,
+      positionNotional: 110,
+    },
+    config,
+    openOrdersReconcileFailureStreak: 2,
+    wsWatchdogTimeoutCountWindow: 2,
+    blockedAgeMs: 1900000,
+    blockedCountDeltaWindow: 70,
+  });
+  assert.equal(triggered.allowed, true, "risk trigger should allow ask question");
+  assert(triggered.triggerReasons.includes("drawdown_threshold"), "drawdown trigger should be present");
+  assert(triggered.triggerReasons.includes("daily_loss_threshold"), "daily pnl trigger should be present");
+  assert(triggered.triggerReasons.includes("position_notional_threshold"), "position notional trigger should be present");
+  assert(triggered.triggerReasons.includes("reconcile_failure_streak"), "reconcile trigger should be present");
+  assert(triggered.triggerReasons.includes("ws_watchdog_timeout_rate"), "ws timeout trigger should be present");
 }
 
 async function testAskQuestionPolicyGuards() {
@@ -1609,6 +1680,7 @@ async function main() {
   await testLineAllowlistRejection();
   await testAskQuestionPayloadFormatting();
   await testDailyEvaluationPayloadFormatting();
+  await testAskQuestionTriggerGate();
   await testAskQuestionPolicyGuards();
   await testAskQuestionTtlDefaultAction();
   await testStrategyTrendBreakoutSignal();
@@ -1636,3 +1708,4 @@ main().catch((error) => {
   console.error(`Test failed: ${error.message}`);
   process.exitCode = 1;
 });
+

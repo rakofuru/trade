@@ -111,11 +111,22 @@ const BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS = 10 * 60 * 1000;
 
 function normalizeAskQuestionAction(value, fallback = "HOLD") {
   const action = String(value || "").toUpperCase();
+  if (action === "APPROVE") {
+    return "RESUME";
+  }
   if (ASKQUESTION_ACTIONS.has(action)) {
     return action;
   }
   const normalizedFallback = String(fallback || "HOLD").toUpperCase();
+  if (normalizedFallback === "APPROVE") {
+    return "RESUME";
+  }
   return ASKQUESTION_ACTIONS.has(normalizedFallback) ? normalizedFallback : "HOLD";
+}
+
+function isFlatPositionSide(positionSide = "flat") {
+  const side = String(positionSide || "flat").toLowerCase();
+  return side === "flat" || side === "none" || side === "neutral";
 }
 
 function parseDailyEvalAtUtc(value) {
@@ -216,6 +227,180 @@ export function evaluateAskQuestionPolicy({
     dailyMax,
     dailyCount,
     dayKey: currentDayKey,
+  };
+}
+
+function normalizeDailyPnlThreshold(value, fallback = -10) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) {
+    return fallback;
+  }
+  return raw > 0 ? -Math.abs(raw) : raw;
+}
+
+function isLikelyNoTradeRegime({ phase, reasonCode, signalSummary }) {
+  const joined = [
+    String(phase || ""),
+    String(reasonCode || ""),
+    String(signalSummary || ""),
+  ].join(" ").toUpperCase();
+  return joined.includes("NO_TRADE_REGIME");
+}
+
+function recommendAskQuestionAction({ isFlat, triggerReasons, forced }) {
+  const reasonSet = new Set(triggerReasons || []);
+  if (!isFlat) {
+    if (
+      forced
+      || reasonSet.has("drawdown_threshold")
+      || reasonSet.has("daily_loss_threshold")
+      || reasonSet.has("position_notional_threshold")
+      || reasonSet.has("reconcile_failure_streak")
+      || reasonSet.has("ws_watchdog_timeout_rate")
+    ) {
+      return "FLATTEN";
+    }
+    return "PAUSE";
+  }
+  if (forced || reasonSet.has("reconcile_failure_streak") || reasonSet.has("ws_watchdog_timeout_rate")) {
+    return "PAUSE";
+  }
+  return "HOLD";
+}
+
+export function evaluateAskQuestionTriggerGate({
+  phase = "",
+  reasonCode = "unknown",
+  signalSummary = "",
+  positionSide = "flat",
+  riskSnapshot = {},
+  config = {},
+  openOrdersReconcileFailureStreak = 0,
+  wsWatchdogTimeoutCountWindow = 0,
+  blockedAgeMs = 0,
+  blockedCountDeltaWindow = 0,
+} = {}) {
+  const isFlat = isFlatPositionSide(positionSide);
+  const phaseUpper = String(phase || "").toUpperCase();
+  const reasonUpper = String(reasonCode || "").toUpperCase();
+  const drawdownBps = Number(riskSnapshot?.drawdownBps || 0);
+  const dailyPnlUsd = Number(riskSnapshot?.dailyPnl || 0);
+  const positionNotional = Number(riskSnapshot?.positionNotional || 0);
+  const openOrders = Math.max(0, Number(riskSnapshot?.openOrders || 0));
+
+  const drawdownThreshold = Math.max(0, Number(config.askQuestionTriggerDrawdownBps || 150));
+  const dailyPnlThreshold = normalizeDailyPnlThreshold(config.askQuestionTriggerDailyPnlUsd, -10);
+  const positionRatio = Math.max(0, Number(config.askQuestionTriggerPositionNotionalRatio || 0.8));
+  const positionLimit = Math.max(0, Number(config.riskMaxPositionNotionalUsd || 0));
+  const positionThreshold = positionLimit > 0 ? (positionLimit * positionRatio) : 0;
+  const reconcileThreshold = Math.max(1, Number(config.askQuestionTriggerReconcileFailureStreak || 2));
+  const wsTimeoutThreshold = Math.max(1, Number(config.askQuestionTriggerWsTimeouts15m || 2));
+  const blockedAgeThreshold = Math.max(60_000, Number(config.askQuestionTriggerBlockedAgeMs || 1800000));
+  const blockedGrowthThreshold = Math.max(1, Number(config.askQuestionTriggerBlockedGrowth15m || 50));
+  const suppressFlatLowRisk = config.askQuestionSuppressFlatLowRisk !== false;
+
+  const forced = phaseUpper.startsWith("P0_")
+    || phaseUpper.includes("RISK")
+    || phaseUpper.includes("STABILITY")
+    || phaseUpper.includes("SHUTDOWN")
+    || reasonUpper.includes("RISK_LIMIT")
+    || reasonUpper.includes("BUDGET_EXHAUSTED");
+
+  const triggerReasons = [];
+  if (forced) {
+    triggerReasons.push("forced_phase");
+  }
+  if (drawdownThreshold > 0 && drawdownBps >= drawdownThreshold) {
+    triggerReasons.push("drawdown_threshold");
+  }
+  if (Number.isFinite(dailyPnlThreshold) && dailyPnlUsd <= dailyPnlThreshold) {
+    triggerReasons.push("daily_loss_threshold");
+  }
+  if (positionThreshold > 0 && positionNotional >= positionThreshold) {
+    triggerReasons.push("position_notional_threshold");
+  }
+  if (Number(openOrdersReconcileFailureStreak || 0) >= reconcileThreshold) {
+    triggerReasons.push("reconcile_failure_streak");
+  }
+  if (Number(wsWatchdogTimeoutCountWindow || 0) >= wsTimeoutThreshold) {
+    triggerReasons.push("ws_watchdog_timeout_rate");
+  }
+  if (
+    Number(blockedAgeMs || 0) >= blockedAgeThreshold
+    && Number(blockedCountDeltaWindow || 0) >= blockedGrowthThreshold
+  ) {
+    triggerReasons.push("blocked_persistent_growth");
+  }
+  if (!isFlat && (phaseUpper.includes("BLOCKED") || reasonUpper.includes("BLOCKED"))) {
+    triggerReasons.push("in_position_blocked");
+  }
+
+  const lowRiskNoTradeFlat = isFlat
+    && isLikelyNoTradeRegime({ phase, reasonCode, signalSummary })
+    && drawdownBps < drawdownThreshold
+    && dailyPnlUsd > dailyPnlThreshold
+    && (positionThreshold <= 0 || positionNotional < positionThreshold)
+    && openOrders <= 0
+    && Number(openOrdersReconcileFailureStreak || 0) < reconcileThreshold
+    && Number(wsWatchdogTimeoutCountWindow || 0) < wsTimeoutThreshold
+    && !forced;
+  if (suppressFlatLowRisk && lowRiskNoTradeFlat) {
+    return {
+      allowed: false,
+      suppressReason: "flat_low_risk_no_trade",
+      triggerReasons: [],
+      recommendedAction: "HOLD",
+      approvedAction: "RESUME",
+      thresholds: {
+        drawdownThreshold,
+        dailyPnlThreshold,
+        positionThreshold,
+        reconcileThreshold,
+        wsTimeoutThreshold,
+        blockedAgeThreshold,
+        blockedGrowthThreshold,
+      },
+    };
+  }
+
+  if (!triggerReasons.length) {
+    return {
+      allowed: false,
+      suppressReason: "trigger_not_met",
+      triggerReasons: [],
+      recommendedAction: isFlat ? "HOLD" : "PAUSE",
+      approvedAction: "RESUME",
+      thresholds: {
+        drawdownThreshold,
+        dailyPnlThreshold,
+        positionThreshold,
+        reconcileThreshold,
+        wsTimeoutThreshold,
+        blockedAgeThreshold,
+        blockedGrowthThreshold,
+      },
+    };
+  }
+
+  return {
+    allowed: true,
+    suppressReason: null,
+    triggerReasons,
+    recommendedAction: recommendAskQuestionAction({
+      isFlat,
+      triggerReasons,
+      forced,
+    }),
+    approvedAction: "RESUME",
+    thresholds: {
+      drawdownThreshold,
+      dailyPnlThreshold,
+      positionThreshold,
+      reconcileThreshold,
+      wsTimeoutThreshold,
+      blockedAgeThreshold,
+      blockedGrowthThreshold,
+    },
   };
 }
 
@@ -511,6 +696,15 @@ export class TradingEngine {
         firstAt: Math.max(0, Number(x.firstAt || 0)),
         lastAt: Math.max(0, Number(x.lastAt || 0)),
         lastEscalatedAt: Math.max(0, Number(x.lastEscalatedAt || 0)),
+        samples: Array.isArray(x.samples)
+          ? x.samples
+            .map((sample) => ({
+              ts: Math.max(0, Number(sample?.ts || 0)),
+              count: Math.max(0, Number(sample?.count || 0)),
+            }))
+            .filter((sample) => sample.ts > 0)
+            .slice(-300)
+          : [],
       },
     ]));
     this.lastDailyEvalSentDayKey = String(runtime.lastDailyEvalSentDayKey || "");
@@ -627,7 +821,7 @@ export class TradingEngine {
       };
     }
 
-    if (action === "RESUME" || action === "APPROVE") {
+    if (action === "RESUME") {
       if (coin === "ALL") {
         this.manualGlobalPauseUntil = 0;
         this.manualGlobalPauseReason = "";
@@ -1784,26 +1978,52 @@ export class TradingEngine {
       firstAt: now,
       lastAt: 0,
       lastEscalatedAt: 0,
+      samples: [],
     };
 
     if (existing.lastAt > 0 && (now - existing.lastAt) > BLOCKED_CYCLE_ESCALATION_WINDOW_MS) {
       existing.count = 0;
       existing.firstAt = now;
+      existing.samples = [];
     }
     if (existing.count <= 0) {
       existing.firstAt = now;
     }
     existing.count += 1;
     existing.lastAt = now;
+    if (!Array.isArray(existing.samples)) {
+      existing.samples = [];
+    }
+    existing.samples.push({
+      ts: now,
+      count: existing.count,
+    });
+    const growthWindowMs = Math.max(60_000, Number(this.config.askQuestionTriggerWindowMs || 900000));
+    existing.samples = existing.samples
+      .filter((sample) => sample.ts > 0 && (now - sample.ts) <= growthWindowMs)
+      .slice(-300);
+
     this.blockedCycleTrackerByCoin.set(coin, existing);
 
     const ageMs = Math.max(0, now - Number(existing.firstAt || now));
+    const baseCount = existing.samples.length
+      ? Number(existing.samples[0]?.count || existing.count)
+      : existing.count;
+    const blockedCountDelta15m = Math.max(0, existing.count - baseCount);
     const reasonCooldownMs = Math.max(
       Number(this.config.askQuestionReasonCooldownMs || 7200000),
       BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS,
     );
-    const persistent = existing.count >= BLOCKED_CYCLE_ESCALATION_COUNT
-      && ageMs >= BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS;
+    const blockedAgeThresholdMs = Math.max(
+      BLOCKED_CYCLE_ESCALATION_MIN_AGE_MS,
+      Number(this.config.askQuestionTriggerBlockedAgeMs || 1800000),
+    );
+    const blockedGrowthThreshold = Math.max(
+      1,
+      Number(this.config.askQuestionTriggerBlockedGrowth15m || BLOCKED_CYCLE_ESCALATION_COUNT),
+    );
+    const persistent = ageMs >= blockedAgeThresholdMs
+      && blockedCountDelta15m >= blockedGrowthThreshold;
     if (!persistent) {
       return;
     }
@@ -1820,7 +2040,8 @@ export class TradingEngine {
         reasonCode,
         blockedCount: existing.count,
         blockedAgeMs: ageMs,
-        windowMs: BLOCKED_CYCLE_ESCALATION_WINDOW_MS,
+        blockedCountDelta15m,
+        windowMs: growthWindowMs,
       },
     });
   }
@@ -4712,6 +4933,50 @@ export class TradingEngine {
     }
   }
 
+  #countRecentMetricEvents(type, windowMs, now = Date.now(), maxLines = 30000) {
+    const metricType = String(type || "");
+    if (!metricType) {
+      return 0;
+    }
+    const since = now - Math.max(1000, Number(windowMs || 0));
+    const rows = this.storage.readStream("metrics", { maxLines });
+    let count = 0;
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const row = rows[i] || {};
+      const ts = Number(row?.ts || 0);
+      if (!(ts > 0)) {
+        continue;
+      }
+      if (ts < since) {
+        break;
+      }
+      if (String(row?.type || "") === metricType) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  #summarizeAskQuestionDetail(detail = null) {
+    if (!detail || typeof detail !== "object") {
+      const text = String(detail || "").trim();
+      return text ? text.slice(0, 180) : "";
+    }
+    const entries = Object.entries(detail)
+      .filter(([, value]) => value !== undefined && value !== null)
+      .map(([key, value]) => {
+        if (typeof value === "number") {
+          const normalized = Number.isInteger(value) ? value : Number(value.toFixed(6));
+          return `${key}=${normalized}`;
+        }
+        if (typeof value === "boolean") {
+          return `${key}=${value ? "true" : "false"}`;
+        }
+        return `${key}=${String(value).slice(0, 80)}`;
+      });
+    return entries.slice(0, 6).join(", ");
+  }
+
   async #maybeDispatchAskQuestion({
     phase,
     decision = null,
@@ -4734,6 +4999,52 @@ export class TradingEngine {
       || "unknown",
     );
     const reasonCode = sanitizeReasonCode(reason || decision?.signal?.reasonCode || signalSummary);
+
+    const openPositions = summarizeOpenPositions(this.lastUserState || {});
+    const coinPosition = openPositions.find((x) => String(x?.coin || "").toUpperCase() === coin) || null;
+    const activePosition = coinPosition || openPositions[0] || null;
+    const positionSide = Number(activePosition?.size || 0) > 0
+      ? "long"
+      : (Number(activePosition?.size || 0) < 0 ? "short" : "flat");
+    const midPx = Number(this.marketData.mid(coin) || activePosition?.markPx || 0);
+    const positionNotional = Number(
+      activePosition?.notional
+      || (Math.abs(Number(activePosition?.size || 0)) * Math.max(0, midPx))
+      || 0,
+    );
+
+    const gateWindowMs = Math.max(60_000, Number(this.config.askQuestionTriggerWindowMs || 900000));
+    const wsWatchdogTimeoutCountWindow = this.#countRecentMetricEvents(
+      "ws_watchdog_timeout",
+      gateWindowMs,
+      now,
+    );
+    const blockedAgeMs = Number(detail?.blockedAgeMs || 0);
+    const blockedCountDeltaWindow = Number(detail?.blockedCountDelta15m || 0);
+    const gate = evaluateAskQuestionTriggerGate({
+      phase: String(phase || "unknown"),
+      reasonCode,
+      signalSummary,
+      positionSide,
+      riskSnapshot: this.riskSnapshot,
+      config: this.config,
+      openOrdersReconcileFailureStreak: this.openOrdersReconcileFailureStreak,
+      wsWatchdogTimeoutCountWindow,
+      blockedAgeMs,
+      blockedCountDeltaWindow,
+    });
+    if (!gate.allowed) {
+      this.storage.appendMetric({
+        type: "ask_question_suppressed",
+        phase: String(phase || "unknown"),
+        coin,
+        reasonCode,
+        suppressReason: gate.suppressReason,
+        triggerWindowMs: gateWindowMs,
+      });
+      return;
+    }
+
     const dayKey = utcDayKey(now);
     const policy = evaluateAskQuestionPolicy({
       nowTs: now,
@@ -4764,7 +5075,7 @@ export class TradingEngine {
 
     const fingerprint = crypto
       .createHash("sha1")
-      .update([phase, coin, regime, reasonCode, signalSummary].join("|"))
+      .update([phase, coin, regime, reasonCode, signalSummary, ...(gate.triggerReasons || [])].join("|"))
       .digest("hex");
     if (fingerprint === this.lastAskQuestionFingerprint && (now - this.lastAskQuestionAt) < 120000) {
       this.storage.appendMetric({
@@ -4777,42 +5088,34 @@ export class TradingEngine {
       return;
     }
 
-    const openPositions = summarizeOpenPositions(this.lastUserState || {});
-    const coinPosition = openPositions.find((x) => String(x?.coin || "").toUpperCase() === coin) || null;
-    const activePosition = coinPosition || openPositions[0] || null;
     const questionId = `ask_${now}_${coin.toLowerCase()}_${crypto.randomBytes(3).toString("hex")}`;
     const ttlSecRaw = Number(detail?.ttlSec || decision?.signal?.ttlSec || 300);
     const ttlSec = Number.isFinite(ttlSecRaw) && ttlSecRaw > 0
       ? Math.min(3600, Math.max(30, Math.floor(ttlSecRaw)))
       : 300;
-    const positionSide = Number(activePosition?.size || 0) > 0
-      ? "long"
-      : (Number(activePosition?.size || 0) < 0 ? "short" : "flat");
-    const options = [];
-    const side = String(decision?.signal?.side || "").toLowerCase();
-    if (side === "buy") {
-      options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
-    } else if (side === "sell") {
-      options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
-    } else {
-      options.push("HOLD", "RESUME", "PAUSE", "FLATTEN");
-    }
 
+    const options = [
+      "APPROVE(RESUME)",
+      "PAUSE",
+      "HOLD",
+      "FLATTEN",
+      "DETAIL",
+    ];
+    const detailSummary = this.#summarizeAskQuestionDetail(detail);
     const dilemmas = [
       `reasonCode=${reasonCode}`,
       `phase=${String(phase || "unknown")}`,
-      detail && typeof detail === "object"
-        ? JSON.stringify(detail).slice(0, 180)
-        : String(detail || ""),
+      detailSummary,
     ].filter(Boolean).slice(0, 3);
 
     const payload = {
       questionId,
       ts: now,
       coin,
-      midPx: Number(this.marketData.mid(coin) || 0),
+      midPx,
       positionSize: Number(activePosition?.size || 0),
       positionSide,
+      positionNotional,
       openOrders: Number(this.riskSnapshot?.openOrders || this.openOrders.size || 0),
       dailyPnlUsd: Number(this.riskSnapshot?.dailyPnl || 0),
       drawdownBps: Number(this.riskSnapshot?.drawdownBps || 0),
@@ -4829,6 +5132,9 @@ export class TradingEngine {
         positionSide,
         config: this.config,
       }),
+      recommendedAction: gate.recommendedAction,
+      approvedAction: gate.approvedAction,
+      triggerReasons: gate.triggerReasons,
       dilemmas,
       options,
     };
@@ -4865,6 +5171,9 @@ export class TradingEngine {
         reasonCode: policy.normalizedReasonCode,
         reason,
         ttlSec,
+        recommendedAction: gate.recommendedAction,
+        approvedAction: gate.approvedAction,
+        triggerReasons: gate.triggerReasons,
         sentCount: Number(result?.sentCount || 0),
         sent: Boolean(result?.sent),
       });
@@ -5243,6 +5552,15 @@ export class TradingEngine {
           firstAt: Math.max(0, Number(row?.firstAt || 0)),
           lastAt: Math.max(0, Number(row?.lastAt || 0)),
           lastEscalatedAt: Math.max(0, Number(row?.lastEscalatedAt || 0)),
+          samples: Array.isArray(row?.samples)
+            ? row.samples
+              .map((sample) => ({
+                ts: Math.max(0, Number(sample?.ts || 0)),
+                count: Math.max(0, Number(sample?.count || 0)),
+              }))
+              .filter((sample) => sample.ts > 0)
+              .slice(-300)
+            : [],
         }))
         .slice(-50),
       lastDailyEvalSentDayKey: String(this.lastDailyEvalSentDayKey || ""),

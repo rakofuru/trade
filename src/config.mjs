@@ -331,6 +331,47 @@ export function loadConfig(cwd = process.cwd()) {
       env.ASKQUESTION_REASON_COOLDOWN_MS,
       7200000,
     ),
+    askQuestionTriggerWindowMs: parseInteger(
+      "ASKQUESTION_TRIGGER_WINDOW_MS",
+      env.ASKQUESTION_TRIGGER_WINDOW_MS,
+      900000,
+    ),
+    askQuestionTriggerDrawdownBps: parseNumber(
+      "ASKQUESTION_TRIGGER_DRAWDOWN_BPS",
+      env.ASKQUESTION_TRIGGER_DRAWDOWN_BPS,
+      150,
+    ),
+    askQuestionTriggerDailyPnlUsd: parseNumber(
+      "ASKQUESTION_TRIGGER_DAILY_PNL_USD",
+      env.ASKQUESTION_TRIGGER_DAILY_PNL_USD,
+      -10,
+    ),
+    askQuestionTriggerPositionNotionalRatio: parseNumber(
+      "ASKQUESTION_TRIGGER_POSITION_NOTIONAL_RATIO",
+      env.ASKQUESTION_TRIGGER_POSITION_NOTIONAL_RATIO,
+      0.8,
+    ),
+    askQuestionTriggerReconcileFailureStreak: parseInteger(
+      "ASKQUESTION_TRIGGER_RECONCILE_FAILURE_STREAK",
+      env.ASKQUESTION_TRIGGER_RECONCILE_FAILURE_STREAK,
+      2,
+    ),
+    askQuestionTriggerWsTimeouts15m: parseInteger(
+      "ASKQUESTION_TRIGGER_WS_TIMEOUTS_15M",
+      env.ASKQUESTION_TRIGGER_WS_TIMEOUTS_15M,
+      2,
+    ),
+    askQuestionTriggerBlockedAgeMs: parseInteger(
+      "ASKQUESTION_TRIGGER_BLOCKED_AGE_MS",
+      env.ASKQUESTION_TRIGGER_BLOCKED_AGE_MS,
+      1800000,
+    ),
+    askQuestionTriggerBlockedGrowth15m: parseInteger(
+      "ASKQUESTION_TRIGGER_BLOCKED_GROWTH_15M",
+      env.ASKQUESTION_TRIGGER_BLOCKED_GROWTH_15M,
+      50,
+    ),
+    askQuestionSuppressFlatLowRisk: parseBoolean(env.ASKQUESTION_SUPPRESS_FLAT_LOW_RISK, true),
     askQuestionTtlDefaultActionFlat: parseMode(
       env.ASKQUESTION_TTL_DEFAULT_ACTION_FLAT || "hold",
       ["hold", "resume", "pause", "flatten", "cancel_orders"],

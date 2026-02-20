@@ -39,6 +39,8 @@ function normalize(payload = {}) {
     watchdogCount: Math.max(0, Number(payload.watchdogCount || 0)),
     reconcileFailCount: Math.max(0, Number(payload.reconcileFailCount || 0)),
     cleanupFailCount: Math.max(0, Number(payload.cleanupFailCount || 0)),
+    askQuestionCount: Math.max(0, Number(payload.askQuestionCount || 0)),
+    stopReasonTop: compact(payload.stopReasonTop || "n/a", 80),
     extraSummaryLines: Array.isArray(payload.extraSummaryLines)
       ? payload.extraSummaryLines.slice(0, 20).map((x) => compact(x, 120))
       : [],
@@ -53,9 +55,9 @@ export function buildDailyEvaluationHumanMessage(payload = {}) {
     `- 実現損益: ${p.dailyRealizedPnlUsd} / 最大DD: ${p.maxDdBps}bps`,
     `- 取引回数: entry=${p.entryCount} exit=${p.exitCount} / 勝率: ${p.winRate}`,
     `- 主要コスト: slippage推定=${p.slippageEstimate} / reject=${p.rejectCount}`,
-    `- レジーム別の成績上位: ${p.regimeTop}`,
-    `- レジーム別の成績下位: ${p.regimeBottom}`,
+    `- レジーム成績: 上位=${p.regimeTop} / 下位=${p.regimeBottom}`,
     `- 異常: watchdog=${p.watchdogCount} reconcile_fail=${p.reconcileFailCount} cleanup_fail=${p.cleanupFailCount}`,
+    `- 運用: AskQuestion=${p.askQuestionCount} / 停止理由Top=${p.stopReasonTop}`,
   ].join("\n");
 }
 
@@ -93,6 +95,8 @@ export function buildDailyEvaluationPromptMessage(payload = {}) {
     `watchdogCount=${p.watchdogCount}`,
     `reconcileFailCount=${p.reconcileFailCount}`,
     `cleanupFailCount=${p.cleanupFailCount}`,
+    `askQuestionCount=${p.askQuestionCount}`,
+    `stopReasonTop=${p.stopReasonTop}`,
   ];
   for (const line of p.extraSummaryLines) {
     lines.push(`extra=${line}`);

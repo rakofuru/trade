@@ -9,7 +9,7 @@ const ACTIONS = new Set([
   "FLATTEN",
   "CANCEL_ORDERS",
   "CUSTOM",
-  // backward compatible
+  // backward compatible aliases
   "APPROVE",
   "REJECT",
 ]);
@@ -35,6 +35,14 @@ function parseTtlSec(raw) {
     return null;
   }
   return Math.min(86400, n);
+}
+
+function normalizeAction(rawAction) {
+  const action = String(rawAction || "").toUpperCase();
+  if (action === "APPROVE") {
+    return "RESUME";
+  }
+  return action;
 }
 
 function findDecisionHeaderIndex(lines) {
@@ -95,14 +103,15 @@ export function parseBotDecisionMessage(text) {
   }
   const { header, values } = parseBlockValues(lines, startIdx);
 
-  const action = String(values.action || "").toUpperCase();
-  if (!ACTIONS.has(action)) {
+  const rawAction = String(values.action || "").toUpperCase();
+  if (!ACTIONS.has(rawAction)) {
     return {
       ok: false,
       error: "invalid_action",
       message: "action が不正です。",
     };
   }
+  const action = normalizeAction(rawAction);
 
   const coinRaw = String(values.coin || "ALL").toUpperCase();
   const coin = COINS.has(coinRaw) ? coinRaw : null;
@@ -141,6 +150,7 @@ export function parseBotDecisionMessage(text) {
       header,
       version: 2,
       action,
+      rawAction,
       coin,
       size,
       reason,
@@ -160,7 +170,7 @@ export function buildDecisionTemplate({
   reason = "human_decision",
   ttlSec = 300,
 } = {}) {
-  const safeAction = String(action || "HOLD").toUpperCase();
+  const safeAction = normalizeAction(action || "HOLD");
   const safeTtl = ttlSec === null || ttlSec === undefined
     ? ""
     : Math.max(0, Math.floor(Number(ttlSec) || 0));

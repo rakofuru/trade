@@ -32,6 +32,9 @@ function normalize(payload = {}) {
     ? Math.min(86400, Math.floor(ttlSecRaw))
     : 300;
   const ts = Number(payload.ts || Date.now());
+  const triggerReasons = Array.isArray(payload.triggerReasons)
+    ? payload.triggerReasons.slice(0, 6).map((x) => compact(x, 60))
+    : [];
   return {
     questionId: String(payload.questionId || `ask_${ts}`),
     timestampIso: new Date(ts).toISOString(),
@@ -39,6 +42,7 @@ function normalize(payload = {}) {
     midPx: fmtNumber(payload.midPx, 2),
     positionSide: String(payload.positionSide || "flat"),
     positionSize: fmtNumber(payload.positionSize, 6),
+    positionNotional: fmtMoney(payload.positionNotional),
     openOrders: fmtInt(payload.openOrders),
     dailyPnlUsd: fmtMoney(payload.dailyPnlUsd),
     drawdownBps: fmtNumber(payload.drawdownBps, 2),
@@ -49,6 +53,9 @@ function normalize(payload = {}) {
     ttlSec,
     ttlDefaultActionFlat: String(payload.ttlDefaultActionFlat || "HOLD").toUpperCase(),
     ttlDefaultActionInPosition: String(payload.ttlDefaultActionInPosition || "FLATTEN").toUpperCase(),
+    recommendedAction: String(payload.recommendedAction || "HOLD").toUpperCase(),
+    approvedAction: String(payload.approvedAction || "RESUME").toUpperCase(),
+    triggerSummary: triggerReasons.length ? triggerReasons.join(", ") : "n/a",
     dilemmas: Array.isArray(payload.dilemmas)
       ? payload.dilemmas.slice(0, 3).map((x) => compact(x, 100))
       : [],
@@ -65,11 +72,14 @@ export function buildAskQuestionHumanMessage(payload = {}) {
     `- id: ${p.questionId}`,
     `- 時刻(UTC): ${p.timestampIso}`,
     `- 銘柄: ${p.coin} / 価格(mid): ${p.midPx}`,
-    `- ポジ: ${p.positionSide} size=${p.positionSize} / 未約定: ${p.openOrders}`,
+    `- ポジ: ${p.positionSide} size=${p.positionSize} notional=${p.positionNotional} / 未約定: ${p.openOrders}`,
     `- リスク: dailyPnl=${p.dailyPnlUsd} / dd=${p.drawdownBps}bps`,
     `- 状態: regime=${p.regime} / signal=${p.signal}`,
-    `- 詰まり理由: ${p.reasonCode}（${p.phase}）`,
-    `- 期限: ${p.ttlSec} 秒（期限切れ時: flat→${p.ttlDefaultActionFlat} / pos→${p.ttlDefaultActionInPosition}）`,
+    `- 詰まり理由: ${p.reasonCode} (${p.phase})`,
+    `- trigger: ${p.triggerSummary}`,
+    `- recommendedAction=${p.recommendedAction}`,
+    `- approvedAction=${p.approvedAction}  # APPROVE(RESUME)`,
+    `- 期限: ${p.ttlSec} 秒（期限切れ: flat→${p.ttlDefaultActionFlat} / pos→${p.ttlDefaultActionInPosition}）`,
   ].join("\n");
 }
 
@@ -78,17 +88,17 @@ export function buildAskQuestionPromptMessage(payload = {}) {
   const replyTemplate = buildDecisionTemplate({
     version: 2,
     questionId: p.questionId,
-    action: "HOLD",
+    action: p.recommendedAction || "HOLD",
     ttlSec: p.ttlSec,
-    reason: "risk_first_hold",
+    reason: "risk_first_decision",
   });
   const lines = [
     "【あなたへの依頼】",
     "あなたは「暗号資産デリバティブ自動売買 bot の運用判断者」です。",
-    "目的は “破滅回避を最優先しつつ、期待値がある時だけ稼働させる” ことです。",
-    "以下のAskQuestionに対し、必ず次の2部構成で回答してください。",
+    "目的は「破滅回避を最優先しつつ、期待値がある時だけ稼働させる」ことです。",
+    "以下の AskQuestion に対し、必ず次の2部構成で回答してください。",
     "",
-    "(1) 私（人間）向け要約（日本語、自由形式、最大8行）",
+    "(1) 私（人間）向け要約（日本語、最大8行）",
     "- いま何が起きていて、どのリスクが支配的か",
     "- 判断（HOLD/RESUME/PAUSE/FLATTEN）と理由（3点以内）",
     "- 追加で確認すべきこと（あれば1〜2点）",
@@ -99,9 +109,9 @@ export function buildAskQuestionPromptMessage(payload = {}) {
     "```",
     "",
     "【重要】",
-    "- botは(2)のブロックだけを読みます。余計なテキストをブロック内に入れないでください。",
-    "- 時事ネタ/ニュースが必要なら、あなたは自分で検索して良い前提です。",
-    "- ただし短期売買の期待値に直結しない場合は、無理に使わず “不確実” と明言してください。",
+    "- botは(2)のブロックだけを読みます。余計な文をブロック内に入れないでください。",
+    "- APPROVE(RESUME) は action=RESUME と同義です。",
+    "- ニュース/時事の確認が必要なら検索して構いません。不確実なら不確実と明記してください。",
     "",
     "【AskQuestionデータ】",
     `questionId=${p.questionId}`,
@@ -111,6 +121,7 @@ export function buildAskQuestionPromptMessage(payload = {}) {
     `midPx=${p.midPx}`,
     `positionSide=${p.positionSide}`,
     `positionSize=${p.positionSize}`,
+    `positionNotional=${p.positionNotional}`,
     `openOrders=${p.openOrders}`,
     `dailyPnlUsd=${p.dailyPnlUsd}`,
     `drawdownBps=${p.drawdownBps}`,
@@ -118,6 +129,9 @@ export function buildAskQuestionPromptMessage(payload = {}) {
     `signal=${p.signal}`,
     `reasonCode=${p.reasonCode}`,
     `phase=${p.phase}`,
+    `triggerReasons=${p.triggerSummary}`,
+    `recommendedAction=${p.recommendedAction}`,
+    `approvedAction=${p.approvedAction}`,
   ];
   if (p.dilemmas.length) {
     lines.push("dilemmas=");
