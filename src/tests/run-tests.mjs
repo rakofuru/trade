@@ -685,15 +685,18 @@ async function testAskQuestionPayloadFormatting() {
     drawdownBps: 45.6,
     regime: "TREND_UP",
     signalSummary: "breakout_minEdge_borderline",
-    recommendedAction: "HOLD",
+    recommendedAction: "PAUSE",
     approvedAction: "RESUME",
+    defaultAction: "HOLD",
+    requiresHuman: true,
     triggerReasons: ["blocked_persistent_growth"],
     dilemmas: ["edge不足", "ボラ高止まり", "方向感なし"],
-    options: ["APPROVE(RESUME)", "PAUSE", "DETAIL"],
+    options: ["GPT_REPLAY", "DETAIL", "PAUSE", "APPROVE(RESUME)"],
   });
   assert.equal(messages.length, 2, "ask question should be generated as two messages");
   assert(messages[0].includes("【HL Trade Ops / AskQuestion】"), "human message title should exist");
-  assert(messages[0].includes("recommendedAction=HOLD"), "human message should include recommendedAction");
+  assert(messages[0].includes("defaultAction=HOLD"), "human message should include defaultAction");
+  assert(messages[0].includes("requiresHuman=true"), "human message should include requiresHuman");
   assert(messages[0].includes("approvedAction=RESUME"), "human message should include approvedAction");
   assert(messages[1].includes("【あなたへの依頼】"), "prompt message should include request section");
   assert(messages[1].includes("BOT_DECISION_V2"), "reply template V2 header should be embedded");
@@ -710,7 +713,12 @@ async function testAskQuestionQuickReplyPayload() {
   const firstText = String(quickReply.items[0]?.action?.text || "");
   assert(firstText.includes("BOT_DECISION_V2"), "quick reply action should include BOT_DECISION_V2");
   assert(firstText.includes("questionId=ask_test_2"), "quick reply action should include questionId");
-  assert(firstText.includes("action=RESUME"), "quick reply action should map to RESUME");
+  assert(firstText.includes("action=CUSTOM"), "first quick reply should be custom GPT resend");
+  assert(firstText.includes("reason=askq_prompt_resend"), "first quick reply reason should request prompt resend");
+  const secondText = String(quickReply.items[1]?.action?.text || "");
+  assert(secondText.includes("reason=askq_detail"), "second quick reply reason should request detail resend");
+  const fourthText = String(quickReply.items[3]?.action?.text || "");
+  assert(fourthText.includes("action=RESUME"), "fourth quick reply should map to APPROVE(RESUME)");
 }
 
 async function testDailyEvaluationPayloadFormatting() {
@@ -750,8 +758,8 @@ async function testAskQuestionTriggerGate() {
 
   const suppressed = evaluateAskQuestionTriggerGate({
     phase: "cycle_blocked_persistent",
-    reasonCode: "no_trade_regime",
-    signalSummary: "NO_TRADE_REGIME",
+    reasonCode: "cycle_blocked_persistent",
+    signalSummary: "waiting_signal",
     positionSide: "flat",
     riskSnapshot: {
       dailyPnl: -1,
@@ -762,11 +770,11 @@ async function testAskQuestionTriggerGate() {
     config,
     openOrdersReconcileFailureStreak: 0,
     wsWatchdogTimeoutCountWindow: 0,
-    blockedAgeMs: 5 * 60 * 1000,
-    blockedCountDeltaWindow: 5,
+    blockedAgeMs: 60 * 60 * 1000,
+    blockedCountDeltaWindow: 90,
   });
   assert.equal(suppressed.allowed, false, "flat low-risk no-trade should be suppressed");
-  assert.equal(suppressed.suppressReason, "flat_low_risk_no_trade");
+  assert.equal(suppressed.suppressReason, "flat_low_risk");
 
   const triggered = evaluateAskQuestionTriggerGate({
     phase: "cycle_blocked_persistent",

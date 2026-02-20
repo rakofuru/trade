@@ -26,6 +26,11 @@ function compact(value, maxLen = 120) {
   return `${text.slice(0, Math.max(0, maxLen - 3))}...`;
 }
 
+function isFlatPositionSide(positionSide = "flat") {
+  const side = String(positionSide || "flat").toLowerCase();
+  return side === "flat" || side === "none" || side === "neutral";
+}
+
 function normalize(payload = {}) {
   const ttlSecRaw = Number(payload.ttlSec);
   const ttlSec = Number.isFinite(ttlSecRaw) && ttlSecRaw > 0
@@ -35,12 +40,18 @@ function normalize(payload = {}) {
   const triggerReasons = Array.isArray(payload.triggerReasons)
     ? payload.triggerReasons.slice(0, 6).map((x) => compact(x, 60))
     : [];
+  const positionSide = String(payload.positionSide || "flat");
+  const ttlDefaultActionFlat = String(payload.ttlDefaultActionFlat || "HOLD").toUpperCase();
+  const ttlDefaultActionInPosition = String(payload.ttlDefaultActionInPosition || "FLATTEN").toUpperCase();
+  const defaultAction = isFlatPositionSide(positionSide)
+    ? ttlDefaultActionFlat
+    : ttlDefaultActionInPosition;
   return {
     questionId: String(payload.questionId || `ask_${ts}`),
     timestampIso: new Date(ts).toISOString(),
     coin: String(payload.coin || "ALL").toUpperCase(),
     midPx: fmtNumber(payload.midPx, 2),
-    positionSide: String(payload.positionSide || "flat"),
+    positionSide,
     positionSize: fmtNumber(payload.positionSize, 6),
     positionNotional: fmtMoney(payload.positionNotional),
     openOrders: fmtInt(payload.openOrders),
@@ -51,13 +62,15 @@ function normalize(payload = {}) {
     reasonCode: compact(payload.reasonCode || payload.reason || "unknown", 60),
     phase: compact(payload.phase || "unknown", 40),
     ttlSec,
-    ttlDefaultActionFlat: String(payload.ttlDefaultActionFlat || "HOLD").toUpperCase(),
-    ttlDefaultActionInPosition: String(payload.ttlDefaultActionInPosition || "FLATTEN").toUpperCase(),
+    ttlDefaultActionFlat,
+    ttlDefaultActionInPosition,
     recommendedAction: String(payload.recommendedAction || "HOLD").toUpperCase(),
     approvedAction: String(payload.approvedAction || "RESUME").toUpperCase(),
+    defaultAction: String(payload.defaultAction || defaultAction).toUpperCase(),
+    requiresHuman: payload.requiresHuman === true,
     triggerSummary: triggerReasons.length ? triggerReasons.join(", ") : "n/a",
     dilemmas: Array.isArray(payload.dilemmas)
-      ? payload.dilemmas.slice(0, 3).map((x) => compact(x, 100))
+      ? payload.dilemmas.slice(0, 6).map((x) => compact(x, 120))
       : [],
     options: Array.isArray(payload.options)
       ? payload.options.slice(0, 6).map((x) => compact(x, 40))
@@ -77,7 +90,8 @@ export function buildAskQuestionHumanMessage(payload = {}) {
     `- 状態: regime=${p.regime} / signal=${p.signal}`,
     `- 詰まり理由: ${p.reasonCode} (${p.phase})`,
     `- trigger: ${p.triggerSummary}`,
-    `- recommendedAction=${p.recommendedAction}`,
+    `- defaultAction=${p.defaultAction}`,
+    `- requiresHuman=${p.requiresHuman ? "true" : "false"}`,
     `- approvedAction=${p.approvedAction}  # APPROVE(RESUME)`,
     `- 期限: ${p.ttlSec} 秒（期限切れ: flat→${p.ttlDefaultActionFlat} / pos→${p.ttlDefaultActionInPosition}）`,
   ].join("\n");
@@ -88,13 +102,13 @@ export function buildAskQuestionPromptMessage(payload = {}) {
   const replyTemplate = buildDecisionTemplate({
     version: 2,
     questionId: p.questionId,
-    action: p.recommendedAction || "HOLD",
+    action: p.defaultAction || "HOLD",
     ttlSec: p.ttlSec,
     reason: "risk_first_decision",
   });
   const lines = [
     "【あなたへの依頼】",
-    "あなたは「暗号資産デリバティブ自動売買 bot の運用判断者」です。",
+    "あなたは「暗号資産デリバティブ自動売買botの運用判断者」です。",
     "目的は「破滅回避を最優先しつつ、期待値がある時だけ稼働させる」ことです。",
     "以下の AskQuestion に対し、必ず次の2部構成で回答してください。",
     "",
@@ -109,9 +123,9 @@ export function buildAskQuestionPromptMessage(payload = {}) {
     "```",
     "",
     "【重要】",
-    "- botは(2)のブロックだけを読みます。余計な文をブロック内に入れないでください。",
-    "- APPROVE(RESUME) は action=RESUME と同義です。",
-    "- ニュース/時事の確認が必要なら検索して構いません。不確実なら不確実と明記してください。",
+    "- bot は(2)のブロックだけを読みます。余計な文はブロック内に入れないでください。",
+    "- APPROVE(RESUME) は「自動停止からの再開許可」専用です。",
+    "- ニュース/時事が必要なら検索して構いません。不確実なら不確実と明記してください。",
     "",
     "【AskQuestionデータ】",
     `questionId=${p.questionId}`,
@@ -130,7 +144,8 @@ export function buildAskQuestionPromptMessage(payload = {}) {
     `reasonCode=${p.reasonCode}`,
     `phase=${p.phase}`,
     `triggerReasons=${p.triggerSummary}`,
-    `recommendedAction=${p.recommendedAction}`,
+    `defaultAction=${p.defaultAction}`,
+    `requiresHuman=${p.requiresHuman ? "true" : "false"}`,
     `approvedAction=${p.approvedAction}`,
   ];
   if (p.dilemmas.length) {
@@ -141,6 +156,32 @@ export function buildAskQuestionPromptMessage(payload = {}) {
   }
   if (p.options.length) {
     lines.push("options=");
+    for (const item of p.options) {
+      lines.push(`- ${item}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function buildAskQuestionDetailMessage(payload = {}) {
+  const p = normalize(payload);
+  const lines = [
+    "【HL Trade Ops / AskQuestion Detail】",
+    `questionId=${p.questionId}`,
+    `reasonCode=${p.reasonCode}`,
+    `phase=${p.phase}`,
+    `triggerReasons=${p.triggerSummary}`,
+    `defaultAction=${p.defaultAction}`,
+    `requiresHuman=${p.requiresHuman ? "true" : "false"}`,
+  ];
+  if (p.dilemmas.length) {
+    lines.push("dilemmas:");
+    for (const item of p.dilemmas) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (p.options.length) {
+    lines.push("options:");
     for (const item of p.options) {
       lines.push(`- ${item}`);
     }
@@ -159,7 +200,7 @@ export function buildAskQuestionQuickReply(payload = {}) {
   const p = normalize(payload);
   const ttlSec = Math.min(3600, Math.max(30, Number(p.ttlSec || 300)));
   const questionId = String(p.questionId || "");
-  const mkAction = (label, action, reason) => ({
+  const mkDecisionAction = (label, action, reason) => ({
     type: "action",
     action: {
       type: "message",
@@ -173,12 +214,13 @@ export function buildAskQuestionQuickReply(payload = {}) {
       }),
     },
   });
+  const mkCustomAction = (label, reason) => mkDecisionAction(label, "CUSTOM", reason);
   return {
     items: [
-      mkAction("✅ RESUME", "RESUME", "line_quick_resume"),
-      mkAction("⏸ PAUSE", "PAUSE", "line_quick_pause"),
-      mkAction("🟨 HOLD", "HOLD", "line_quick_hold"),
-      mkAction("❌ REJECT", "REJECT", "line_quick_reject"),
+      mkCustomAction("📋 GPT再送", "askq_prompt_resend"),
+      mkCustomAction("ℹ DETAIL", "askq_detail"),
+      mkDecisionAction("⏸ PAUSE", "PAUSE", "line_quick_pause"),
+      mkDecisionAction("✅ APPROVE(RESUME)", "RESUME", "line_quick_approve_resume"),
     ],
   };
 }

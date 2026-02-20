@@ -2,12 +2,18 @@ import http from "node:http";
 import { URL } from "node:url";
 import { parseBotDecisionMessage, decisionTemplateHeader } from "./decision-parser.mjs";
 import { verifyLineSignature } from "./signature.mjs";
-import { buildAskQuestionMessages, buildAskQuestionQuickReply } from "./ask-question.mjs";
+import {
+  buildAskQuestionMessages,
+  buildAskQuestionQuickReply,
+  buildAskQuestionPromptMessage,
+  buildAskQuestionDetailMessage,
+} from "./ask-question.mjs";
 import { buildDailyEvaluationMessages } from "./daily-eval.mjs";
 
 const LINE_API_BASE = "https://api.line.me/v2/bot/message";
 const MAX_LINE_TEXT_LEN = 4800;
 const MAX_LINE_MESSAGES_PER_REQUEST = 5;
+const ASKQUESTION_CACHE_MAX = 300;
 
 function splitTextToLineMessages(text) {
   const source = String(text || "");
@@ -85,6 +91,8 @@ export class LineOpsBridge {
     this.server = null;
     this.listening = false;
     this.allowedUserIds = normalizeUserIdSet(config.lineAllowedUserIds || []);
+    this.askQuestionPayloadById = new Map();
+    this.askQuestionPayloadOrder = [];
   }
 
   isWebhookEnabled() {
@@ -184,6 +192,7 @@ export class LineOpsBridge {
 
     const messages = buildAskQuestionMessages(payload);
     const quickReply = buildAskQuestionQuickReply(payload);
+    this.#rememberAskQuestionPayload(payload);
     const lineMessages = [];
     for (const text of messages) {
       lineMessages.push({
@@ -191,7 +200,7 @@ export class LineOpsBridge {
         text: String(text),
       });
     }
-    if (lineMessages.length > 0) {
+    if (lineMessages.length > 0 && payload?.requiresHuman === true) {
       // Quick reply should be attached to the last delivered message.
       lineMessages[lineMessages.length - 1].quickReply = quickReply;
     }
@@ -306,6 +315,60 @@ export class LineOpsBridge {
     };
   }
 
+  #rememberAskQuestionPayload(payload = {}) {
+    const questionId = String(payload?.questionId || "").trim();
+    if (!questionId) {
+      return;
+    }
+    this.askQuestionPayloadById.set(questionId, {
+      ...payload,
+      _cachedAt: Date.now(),
+    });
+    this.askQuestionPayloadOrder.push(questionId);
+    if (this.askQuestionPayloadOrder.length <= ASKQUESTION_CACHE_MAX) {
+      return;
+    }
+    while (this.askQuestionPayloadOrder.length > ASKQUESTION_CACHE_MAX) {
+      const oldest = this.askQuestionPayloadOrder.shift();
+      if (!oldest) {
+        continue;
+      }
+      if (this.askQuestionPayloadOrder.includes(oldest)) {
+        continue;
+      }
+      this.askQuestionPayloadById.delete(oldest);
+    }
+  }
+
+  async #handleAskQuestionAssistCommand({ command, replyToken }) {
+    const reason = String(command?.reason || "").trim().toLowerCase();
+    if (reason !== "askq_prompt_resend" && reason !== "askq_detail") {
+      return false;
+    }
+    const questionId = String(command?.questionId || "").trim();
+    const payload = this.askQuestionPayloadById.get(questionId);
+    if (!payload) {
+      await this.#replyText(replyToken, `NG: AskQuestion payload not found (questionId=${questionId || "n/a"})`);
+      this.storage.appendMetric({
+        type: "line_askq_assist_missing",
+        reason,
+        questionId: questionId || null,
+      });
+      return true;
+    }
+
+    const text = reason === "askq_prompt_resend"
+      ? buildAskQuestionPromptMessage(payload)
+      : buildAskQuestionDetailMessage(payload);
+    await this.#replyText(replyToken, text);
+    this.storage.appendMetric({
+      type: "line_askq_assist_sent",
+      reason,
+      questionId,
+    });
+    return true;
+  }
+
   async #handleHttpRequest(req, res) {
     const method = String(req.method || "").toUpperCase();
     const url = new URL(String(req.url || "/"), "http://localhost");
@@ -406,6 +469,16 @@ export class LineOpsBridge {
       questionId: command.questionId || null,
       version: command.version || null,
     });
+
+    if (command.action === "CUSTOM") {
+      const handledAssist = await this.#handleAskQuestionAssistCommand({
+        command,
+        replyToken,
+      });
+      if (handledAssist) {
+        return;
+      }
+    }
 
     if (!this.onDecision) {
       await this.#replyText(replyToken, "コマンド受信: handler 未設定のため処理できませんでした。");

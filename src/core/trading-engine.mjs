@@ -238,15 +238,6 @@ function normalizeDailyPnlThreshold(value, fallback = -10) {
   return raw > 0 ? -Math.abs(raw) : raw;
 }
 
-function isLikelyNoTradeRegime({ phase, reasonCode, signalSummary }) {
-  const joined = [
-    String(phase || ""),
-    String(reasonCode || ""),
-    String(signalSummary || ""),
-  ].join(" ").toUpperCase();
-  return joined.includes("NO_TRADE_REGIME");
-}
-
 function recommendAskQuestionAction({ isFlat, triggerReasons, forced }) {
   const reasonSet = new Set(triggerReasons || []);
   if (!isFlat) {
@@ -266,6 +257,13 @@ function recommendAskQuestionAction({ isFlat, triggerReasons, forced }) {
     return "PAUSE";
   }
   return "HOLD";
+}
+
+function isAskQuestionResumeRecoveryAllowed({ triggerReasons = [], forced = false } = {}) {
+  const reasonSet = new Set(triggerReasons || []);
+  return forced
+    || reasonSet.has("reconcile_failure_streak")
+    || reasonSet.has("ws_watchdog_timeout_rate");
 }
 
 export function evaluateAskQuestionTriggerGate({
@@ -307,27 +305,37 @@ export function evaluateAskQuestionTriggerGate({
     || reasonUpper.includes("BUDGET_EXHAUSTED");
 
   const triggerReasons = [];
+  const abnormalTriggerReasons = [];
   if (forced) {
     triggerReasons.push("forced_phase");
+    abnormalTriggerReasons.push("forced_phase");
   }
   if (drawdownThreshold > 0 && drawdownBps >= drawdownThreshold) {
     triggerReasons.push("drawdown_threshold");
+    abnormalTriggerReasons.push("drawdown_threshold");
   }
   if (Number.isFinite(dailyPnlThreshold) && dailyPnlUsd <= dailyPnlThreshold) {
     triggerReasons.push("daily_loss_threshold");
+    abnormalTriggerReasons.push("daily_loss_threshold");
   }
   if (positionThreshold > 0 && positionNotional >= positionThreshold) {
     triggerReasons.push("position_notional_threshold");
+    abnormalTriggerReasons.push("position_notional_threshold");
   }
   if (Number(openOrdersReconcileFailureStreak || 0) >= reconcileThreshold) {
     triggerReasons.push("reconcile_failure_streak");
+    abnormalTriggerReasons.push("reconcile_failure_streak");
   }
   if (Number(wsWatchdogTimeoutCountWindow || 0) >= wsTimeoutThreshold) {
     triggerReasons.push("ws_watchdog_timeout_rate");
+    abnormalTriggerReasons.push("ws_watchdog_timeout_rate");
   }
   if (
+    !isFlat
+    && (
     Number(blockedAgeMs || 0) >= blockedAgeThreshold
     && Number(blockedCountDeltaWindow || 0) >= blockedGrowthThreshold
+    )
   ) {
     triggerReasons.push("blocked_persistent_growth");
   }
@@ -335,8 +343,7 @@ export function evaluateAskQuestionTriggerGate({
     triggerReasons.push("in_position_blocked");
   }
 
-  const lowRiskNoTradeFlat = isFlat
-    && isLikelyNoTradeRegime({ phase, reasonCode, signalSummary })
+  const lowRiskFlat = isFlat
     && drawdownBps < drawdownThreshold
     && dailyPnlUsd > dailyPnlThreshold
     && (positionThreshold <= 0 || positionNotional < positionThreshold)
@@ -344,13 +351,16 @@ export function evaluateAskQuestionTriggerGate({
     && Number(openOrdersReconcileFailureStreak || 0) < reconcileThreshold
     && Number(wsWatchdogTimeoutCountWindow || 0) < wsTimeoutThreshold
     && !forced;
-  if (suppressFlatLowRisk && lowRiskNoTradeFlat) {
+  if (suppressFlatLowRisk && lowRiskFlat) {
     return {
       allowed: false,
-      suppressReason: "flat_low_risk_no_trade",
+      suppressReason: "flat_low_risk",
       triggerReasons: [],
       recommendedAction: "HOLD",
       approvedAction: "RESUME",
+      defaultAction: "HOLD",
+      requiresHuman: false,
+      resumeRecoveryOnly: false,
       thresholds: {
         drawdownThreshold,
         dailyPnlThreshold,
@@ -370,6 +380,9 @@ export function evaluateAskQuestionTriggerGate({
       triggerReasons: [],
       recommendedAction: isFlat ? "HOLD" : "PAUSE",
       approvedAction: "RESUME",
+      defaultAction: isFlat ? "HOLD" : "PAUSE",
+      requiresHuman: !isFlat,
+      resumeRecoveryOnly: false,
       thresholds: {
         drawdownThreshold,
         dailyPnlThreshold,
@@ -382,16 +395,27 @@ export function evaluateAskQuestionTriggerGate({
     };
   }
 
+  const recommendedAction = recommendAskQuestionAction({
+    isFlat,
+    triggerReasons,
+    forced,
+  });
+  const resumeRecoveryOnly = isAskQuestionResumeRecoveryAllowed({
+    triggerReasons,
+    forced,
+  });
+  const requiresHuman = abnormalTriggerReasons.length > 0
+    || triggerReasons.includes("in_position_blocked");
+
   return {
     allowed: true,
     suppressReason: null,
     triggerReasons,
-    recommendedAction: recommendAskQuestionAction({
-      isFlat,
-      triggerReasons,
-      forced,
-    }),
+    recommendedAction,
     approvedAction: "RESUME",
+    defaultAction: isFlat ? "HOLD" : "PAUSE",
+    requiresHuman,
+    resumeRecoveryOnly,
     thresholds: {
       drawdownThreshold,
       dailyPnlThreshold,
@@ -685,6 +709,9 @@ export class TradingEngine {
           ttlSec: Math.max(1, Number(x?.ttlSec || 300)),
           positionSide: String(x?.positionSide || "flat").toLowerCase(),
           signalSummary: String(x?.signalSummary || ""),
+          resumeRecoveryOnly: Boolean(x?.resumeRecoveryOnly),
+          requiresHuman: Boolean(x?.requiresHuman),
+          defaultAction: normalizeAskQuestionAction(x?.defaultAction, "HOLD"),
         }];
       })
       .filter(Boolean));
@@ -822,6 +849,15 @@ export class TradingEngine {
     }
 
     if (action === "RESUME") {
+      const resumeRecoveryOnlyRequested = String(reason || "")
+        .toLowerCase()
+        .includes("line_quick_approve_resume");
+      if (resumeRecoveryOnlyRequested && !Boolean(pending?.resumeRecoveryOnly)) {
+        return {
+          ok: false,
+          message: "APPROVE(RESUME) is allowed only for recovery scenarios.",
+        };
+      }
       if (coin === "ALL") {
         this.manualGlobalPauseUntil = 0;
         this.manualGlobalPauseReason = "";
@@ -956,6 +992,9 @@ export class TradingEngine {
       ttlSec: Math.max(1, Number(row?.ttlSec || 300)),
       positionSide: String(row?.positionSide || "flat").toLowerCase(),
       signalSummary: String(row?.signalSummary || ""),
+      resumeRecoveryOnly: Boolean(row?.resumeRecoveryOnly),
+      requiresHuman: Boolean(row?.requiresHuman),
+      defaultAction: normalizeAskQuestionAction(row?.defaultAction, "HOLD"),
     };
     this.askQuestionPending.set(questionId, payload);
     this.#scheduleAskQuestionPendingTimeout(questionId, payload.dueAt);
@@ -5095,11 +5134,10 @@ export class TradingEngine {
       : 300;
 
     const options = [
-      "APPROVE(RESUME)",
-      "PAUSE",
-      "HOLD",
-      "FLATTEN",
+      "GPT_REPLAY",
       "DETAIL",
+      "PAUSE",
+      "APPROVE(RESUME)",
     ];
     const detailSummary = this.#summarizeAskQuestionDetail(detail);
     const dilemmas = [
@@ -5134,6 +5172,8 @@ export class TradingEngine {
       }),
       recommendedAction: gate.recommendedAction,
       approvedAction: gate.approvedAction,
+      defaultAction: gate.defaultAction,
+      requiresHuman: gate.requiresHuman,
       triggerReasons: gate.triggerReasons,
       dilemmas,
       options,
@@ -5162,6 +5202,9 @@ export class TradingEngine {
         ttlSec,
         positionSide,
         signalSummary,
+        resumeRecoveryOnly: gate.resumeRecoveryOnly,
+        requiresHuman: gate.requiresHuman,
+        defaultAction: gate.defaultAction,
       });
       this.storage.appendMetric({
         type: "ask_question_dispatched",
@@ -5173,6 +5216,9 @@ export class TradingEngine {
         ttlSec,
         recommendedAction: gate.recommendedAction,
         approvedAction: gate.approvedAction,
+        requiresHuman: gate.requiresHuman,
+        defaultAction: gate.defaultAction,
+        resumeRecoveryOnly: gate.resumeRecoveryOnly,
         triggerReasons: gate.triggerReasons,
         sentCount: Number(result?.sentCount || 0),
         sent: Boolean(result?.sent),
@@ -5542,6 +5588,9 @@ export class TradingEngine {
           ttlSec: Number(x?.ttlSec || 300),
           positionSide: String(x?.positionSide || "flat"),
           signalSummary: String(x?.signalSummary || ""),
+          resumeRecoveryOnly: Boolean(x?.resumeRecoveryOnly),
+          requiresHuman: Boolean(x?.requiresHuman),
+          defaultAction: normalizeAskQuestionAction(x?.defaultAction, "HOLD"),
         }))
         .filter((x) => x.questionId)
         .slice(-100),

@@ -67,13 +67,13 @@ npm.cmd run doctor -- --hours 1
   - 1通目: 人間向け短文サマリ
   - 2通目: ChatGPT貼り付け用テンプレ（機械可読返信テンプレ付き）
 - AskQuestion 1通目にはクイックリプライを付与:
-  - `✅ RESUME` / `⏸ PAUSE` / `🟨 HOLD` / `❌ REJECT`
+  - `📋 GPT再送` / `ℹ DETAIL` / `⏸ PAUSE` / `✅ APPROVE(RESUME)`
   - タップすると `BOT_DECISION_V2` ブロックが自動入力されます
 - AskQuestion は頻度制御付き:
   - `ASKQUESTION_COOLDOWN_MS`（coinごとのクールダウン）
   - `ASKQUESTION_DAILY_MAX`（日次上限）
   - `ASKQUESTION_REASON_COOLDOWN_MS`（同一reason抑止）
-  - triggerベース（OR）で発火し、`flat + 低リスク + NO_TRADE_REGIME` は最優先で抑止
+  - triggerベース（OR）で発火し、`flat + 低リスク` は最優先で抑止（NO_TRADE系は原則日次集約）
   - 推奨閾値（初期値）:
     - `ASKQUESTION_TRIGGER_DRAWDOWN_BPS=150`
     - `ASKQUESTION_TRIGGER_DAILY_PNL_USD=-10`
@@ -108,6 +108,7 @@ reason=
 ```
 - bot はメッセージ中の `BOT_DECISION_V2` ブロックのみ解釈します（自由文は無視）
 - `APPROVE` は後方互換で受理されますが、内部では `RESUME` に正規化されます（`APPROVE(RESUME)`）。
+- `APPROVE(RESUME)` は「安全装置停止からの再開許可」用途に限定します。
 - 署名検証（`X-Line-Signature`）とallowlistで拒否判定します
 
 ## 4. Data Layout
