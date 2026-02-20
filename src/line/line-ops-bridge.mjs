@@ -185,18 +185,15 @@ export class LineOpsBridge {
     const messages = buildAskQuestionMessages(payload);
     const quickReply = buildAskQuestionQuickReply(payload);
     const lineMessages = [];
-    if (messages[0]) {
-      lineMessages.push({
-        type: "text",
-        text: String(messages[0]),
-        quickReply,
-      });
-    }
-    for (const text of messages.slice(1)) {
+    for (const text of messages) {
       lineMessages.push({
         type: "text",
         text: String(text),
       });
+    }
+    if (lineMessages.length > 0) {
+      // Quick reply should be attached to the last delivered message.
+      lineMessages[lineMessages.length - 1].quickReply = quickReply;
     }
     return this.#broadcastLineMessages({
       metricType: "line_askquestion_sent",
