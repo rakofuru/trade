@@ -52,14 +52,8 @@ else
   echo "[run-bot] WARN: flock not found; single-instance lock is disabled" >&2
 fi
 
-while [[ -n "${KILL_SWITCH_FILE}" && -f "${KILL_SWITCH_FILE}" ]]; do
-  echo "[run-bot] kill switch active (file=${KILL_SWITCH_FILE}); waiting for removal" >&2
-  sleep 30
-done
-
-cd "${APP_DIR}"
-
 child_pid=""
+stop_requested=0
 
 terminate_child() {
   local sig="${1:-TERM}"
@@ -70,7 +64,7 @@ terminate_child() {
     return 0
   fi
 
-  # Prefer process-group signal so npm + node are terminated together.
+  # Prefer process-group signal so the child tree is terminated together.
   kill -"${sig}" "-${child_pid}" >/dev/null 2>&1 || kill -"${sig}" "${child_pid}" >/dev/null 2>&1 || true
   for _ in {1..20}; do
     if ! kill -0 "${child_pid}" >/dev/null 2>&1; then
@@ -83,16 +77,43 @@ terminate_child() {
 
 on_term() {
   echo "[run-bot] stop signal received; terminating child process group" >&2
+  stop_requested=1
   terminate_child TERM
-  exit 0
 }
 
 trap on_term INT TERM
 
+while [[ -n "${KILL_SWITCH_FILE}" && -f "${KILL_SWITCH_FILE}" ]]; do
+  if [[ "${stop_requested}" -eq 1 ]]; then
+    exit 0
+  fi
+  echo "[run-bot] kill switch active (file=${KILL_SWITCH_FILE}); waiting for removal" >&2
+  for _ in {1..10}; do
+    if [[ "${stop_requested}" -eq 1 ]]; then
+      exit 0
+    fi
+    sleep 3
+  done
+done
+
+cd "${APP_DIR}"
+
 # setsid ensures child process gets its own process group.
 setsid "${NODE_BIN}" src/index.mjs &
 child_pid="$!"
-wait "${child_pid}"
-exit_code="$?"
+
+while kill -0 "${child_pid}" >/dev/null 2>&1; do
+  if [[ "${stop_requested}" -eq 1 ]]; then
+    break
+  fi
+  sleep 1
+done
+
+exit_code=0
+wait "${child_pid}" || exit_code="$?"
 child_pid=""
+
+if [[ "${stop_requested}" -eq 1 ]]; then
+  exit 0
+fi
 exit "${exit_code}"
